@@ -1,6 +1,6 @@
 {
   "name": "@sessionsight/feedback",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "User feedback and survey SDK for SessionSight.",
   "author": "SessionSight",
   "license": "MIT",
@@ -53,7 +53,7 @@
     "verify-hint": "bun run scripts/verify-hint.ts",
     "prebuild": "bun run verify-hint",
     "prepublishOnly": "bun run verify-hint",
-    "build": "bun build src/index.ts --outdir dist --format esm && bun x tsc --emitDeclarationOnly --declaration --outDir dist"
+    "build": "rm -rf dist && bun build src/index.ts --outdir dist --format esm && bun x tsc --emitDeclarationOnly --declaration --outDir dist"
   },
   "peerDependencies": {
     "typescript": "^5"
