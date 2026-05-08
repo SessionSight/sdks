@@ -1,6 +1,6 @@
 {
   "name": "@sessionsight/split-testing",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "A/B and split testing SDK for SessionSight.",
   "author": "SessionSight",
   "license": "MIT",

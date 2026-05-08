@@ -17,7 +17,7 @@ export const integrationHint: IntegrationHint = {
   usageFn: async (req: unknown) => {
     const bound = SessionSightFeedback.forRequest(req);
     if (!bound) return;
-    await bound.submit('YOUR_FEEDBACK_TYPE_ID', { rating: 5, comment: 'Great experience' });
+    await bound.submit('YOUR_FEEDBACK_TYPE_ID', { option: 'YOUR_OPTION_ID', message: 'Great experience' });
   },
   docsUrl: 'https://sessionsight.com/docs/feedback',
 };
