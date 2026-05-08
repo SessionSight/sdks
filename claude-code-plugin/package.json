@@ -2,6 +2,7 @@
   "name": "@sessionsight/claude-code-plugin",
   "version": "0.1.0",
   "description": "SessionSight plugin for Claude Code. Source for the stdio MCP shim that ships in `bin/`.",
+  "license": "MIT",
   "private": true,
   "type": "module",
   "scripts": {
