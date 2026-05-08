@@ -1,0 +1,67 @@
+{
+  "name": "@sessionsight/goals",
+  "version": "1.0.1",
+  "description": "Goal and conversion tracking SDK for SessionSight.",
+  "author": "SessionSight",
+  "license": "MIT",
+  "homepage": "https://sessionsight.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SessionSight/sdks.git",
+    "directory": "packages/goals"
+  },
+  "bugs": {
+    "url": "https://github.com/SessionSight/sdks/issues"
+  },
+  "keywords": [
+    "goals",
+    "conversion-tracking",
+    "analytics",
+    "sessionsight"
+  ],
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    },
+    "./integration-hint": {
+      "import": "./src/integration-hint.ts",
+      "types": "./src/integration-hint.ts"
+    }
+  },
+  "publishConfig": {
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "import": "./dist/index.js",
+        "types": "./dist/index.d.ts"
+      },
+      "./integration-hint": {
+        "import": "./dist/integration-hint.js",
+        "types": "./dist/integration-hint.d.ts"
+      }
+    }
+  },
+  "scripts": {
+    "verify-hint": "bun run scripts/verify-hint.ts",
+    "prebuild": "bun run verify-hint",
+    "prepublishOnly": "bun run verify-hint",
+    "build": "bun build src/index.ts --outdir dist --format esm && bun x tsc --emitDeclarationOnly --declaration --outDir dist"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@sessionsight/sdk-shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@sessionsight/backend-shared": "workspace:*"
+  }
+}

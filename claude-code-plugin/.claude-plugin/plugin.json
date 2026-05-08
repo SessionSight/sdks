@@ -1,0 +1,30 @@
+{
+  "name": "sessionsight",
+  "description": "Use SessionSight from Claude Code to grow your users.",
+  "version": "1.0.0",
+  "author": {
+    "name": "SessionSight",
+    "email": "support@sessionsight.com",
+    "url": "https://sessionsight.com"
+  },
+  "homepage": "https://sessionsight.com",
+  "repository": "https://github.com/SessionSight/sdks",
+  "license": "MIT",
+  "keywords": [
+    "analytics",
+    "session-replay",
+    "ab-testing",
+    "feature-flags",
+    "conversion-tracking",
+    "growth",
+    "mcp",
+    "sessionsight",
+    "marketing"
+  ],
+  "mcpServers": {
+    "sessionsight": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/sessionsight-mcp.js"]
+    }
+  }
+}

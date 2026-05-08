@@ -1,0 +1,71 @@
+{
+  "name": "@sessionsight/insights",
+  "version": "1.0.1",
+  "description": "Session replay, heatmaps, and user analytics SDK for SessionSight.",
+  "author": "SessionSight",
+  "license": "MIT",
+  "homepage": "https://sessionsight.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SessionSight/sdks.git",
+    "directory": "packages/insights"
+  },
+  "bugs": {
+    "url": "https://github.com/SessionSight/sdks/issues"
+  },
+  "keywords": [
+    "analytics",
+    "session-replay",
+    "heatmaps",
+    "user-insights",
+    "sessionsight"
+  ],
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    },
+    "./integration-hint": {
+      "import": "./src/integration-hint.ts",
+      "types": "./src/integration-hint.ts"
+    }
+  },
+  "publishConfig": {
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "import": "./dist/index.js",
+        "types": "./dist/index.d.ts"
+      },
+      "./integration-hint": {
+        "import": "./dist/integration-hint.js",
+        "types": "./dist/integration-hint.d.ts"
+      }
+    }
+  },
+  "scripts": {
+    "verify-hint": "bun run scripts/verify-hint.ts",
+    "prebuild": "bun run verify-hint",
+    "prepublishOnly": "bun run verify-hint",
+    "build": "bun run build.ts",
+    "build:worker": "bun run build.ts --worker-only",
+    "dev:setup": "bun run build.ts --worker-only"
+  },
+  "dependencies": {
+    "rrweb": "^2.0.0-alpha.20"
+  },
+  "devDependencies": {
+    "@sessionsight/backend-shared": "workspace:*",
+    "@sessionsight/sdk-shared": "workspace:*"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

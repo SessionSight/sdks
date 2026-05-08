@@ -1,0 +1,17 @@
+{
+  "name": "@sessionsight/claude-code-plugin",
+  "version": "0.1.0",
+  "description": "SessionSight plugin for Claude Code. Source for the stdio MCP shim that ships in `bin/`.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun run build.ts",
+    "prepublishOnly": "bun run build"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22"
+  }
+}
