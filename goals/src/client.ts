@@ -5,22 +5,21 @@ import {
   validateGoalAmount,
   buildGoalPayload,
   extractIdsFromRequest,
+  fetchWithTimeout,
 } from '@sessionsight/sdk-shared';
-
-const FETCH_TIMEOUT_MS = 10_000;
-
-function fetchWithTimeout(url: string, options: RequestInit): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
-}
 
 export class GoalsClient {
   private apiUrl: string;
   private secretApiKey: string;
   private propertyId: string;
+  private debug: boolean;
 
   constructor(config: GoalsConfig) {
+    // Server-side only. We sniff for `window` plus the absence of `process`
+    // because Bun browser builds shim `process` and Electron's renderer
+    // exposes both, so neither check alone is reliable. Cosmetic guard;
+    // the real constraint is the secret API key, which must never reach
+    // a browser regardless of runtime detection.
     if (typeof window !== 'undefined' && !('process' in globalThis)) {
       throw new Error('@sessionsight/goals is a server-side SDK and cannot be used in the browser.');
     }
@@ -29,6 +28,7 @@ export class GoalsClient {
     this.secretApiKey = config.secretApiKey;
     this.propertyId = config.propertyId;
     this.apiUrl = normalizeApiUrl(config.apiUrl || '');
+    this.debug = config.debug === true;
   }
 
   async increment(goalId: string, options?: IncrementOptions): Promise<GoalResult> {
@@ -74,13 +74,31 @@ export class GoalsClient {
 
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        return { success: false, error: (data as any).error || `HTTP ${res.status}` };
+        // Server returns `{ error: { code, message } }` (see
+        // apps/api/src/utils/handleError.ts). Surface the message so
+        // `error: string` actually carries a string.
+        const errObj = (data as any)?.error;
+        const message =
+          (errObj && typeof errObj === 'object' ? (errObj.message ?? errObj.code) : errObj) ||
+          `HTTP ${res.status}`;
+        return { success: false, error: String(message) };
       }
 
       return { success: true };
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      console.warn('[SessionSight Goals] Request failed:', message);
+      let message: string;
+      if (err instanceof Error) {
+        // The shared fetchWithTimeout aborts after its default timeout;
+        // surface a distinctive message so callers can tell timeouts apart
+        // from generic network errors.
+        message = err.name === 'AbortError' ? 'request timed out after 10s' : err.message;
+      } else {
+        message = 'Unknown error';
+      }
+      if (this.debug) {
+        // eslint-disable-next-line no-console
+        console.warn('[SessionSight Goals] Request failed:', message);
+      }
       return { success: false, error: message };
     }
   }

@@ -8,7 +8,7 @@ const storage: Map<string, string> = (globalThis as any).__testStorage;
 beforeEach(() => {
   storage.clear();
   // Reset cookie store each test. `document.cookie` is stubbed in setup.ts
-  // but as a plain object field — we control it directly here.
+  // but as a plain object field; we control it directly here.
   (globalThis.document as any).cookie = '';
 });
 
@@ -62,7 +62,7 @@ describe('SplitTesting browser: reads ss_sid from cookie on exposure flush', () 
       sendBeacon: (url: string, blob: Blob) => {
         // Read the blob synchronously through its internal data for assertion
         // bun implements Blob.text() so we use that, but sendBeacon must be
-        // synchronous — so we stash the blob and parse later.
+        // synchronous, so we stash the blob and parse later.
         (blob as any)._capturedUrl = url;
         beaconCalls.push({ url, body: blob });
         return true;

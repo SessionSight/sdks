@@ -32,7 +32,6 @@ export interface SplitTestConfigEntry {
 
 export interface SplitTestConfigResponse {
   tests: SplitTestConfigEntry[];
-  ttl: number;
 }
 
 export interface Assignment {

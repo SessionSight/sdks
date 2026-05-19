@@ -90,6 +90,12 @@ beforeEach(() => {
 
   (globalThis as any).crypto = {
     randomUUID: () => 'test-uuid',
+    // Recorder rotates the per-session scramble cipher in its constructor,
+    // which uses crypto.getRandomValues. Forward to the real Bun-provided
+    // crypto if available, fall back to a deterministic byte stream.
+    getRandomValues: (origCrypto && typeof origCrypto.getRandomValues === 'function')
+      ? (buf: any) => origCrypto.getRandomValues(buf)
+      : (buf: any) => { for (let i = 0; i < buf.length; i++) buf[i] = (i * 7 + 1) >>> 0; return buf; },
   };
 });
 
@@ -134,12 +140,14 @@ mock.module('../src/worker-bridge.js', () => ({
     postMetadata() { bridgeCalls.push('postMetadata'); }
     postIdentify() {}
     flush() { bridgeCalls.push('flush'); }
+    flushAndDestroy() { bridgeCalls.push('flushAndDestroy'); }
     sendBeacon() { bridgeCalls.push('sendBeacon'); }
     destroy() { bridgeCalls.push('destroy'); }
     onKilled(_cb: Function) {}
     onPrivacy(_cb: Function) {}
     onQuotaExceeded(_cb: Function) {}
     onRotate(_cb: Function) {}
+    onVisitorIdSwap(_cb: Function) {}
   },
 }));
 
@@ -322,13 +330,14 @@ describe('idle session timeout with timers', () => {
       await new Promise(resolve => setTimeout(resolve, 250));
       expect(rec.endedByIdle).toBe(true);
 
-      // Bridge.destroy() MUST NOT have been called — the WS needs to stay
+      // Bridge teardown MUST NOT have been called. The WS needs to stay
       // open to receive rotate_session when the backend seals the session.
       expect(bridgeCalls).not.toContain('destroy');
+      expect(bridgeCalls).not.toContain('flushAndDestroy');
 
-      // But a full external stop() DOES destroy the bridge.
+      // But a full external stop() DOES tear down the bridge (via flushAndDestroy).
       rec.stop();
-      expect(bridgeCalls).toContain('destroy');
+      expect(bridgeCalls).toContain('flushAndDestroy');
     } finally {
       (Recorder as any).IDLE_THRESHOLD_MS = origIdleThreshold;
       (Recorder as any).IDLE_SESSION_TIMEOUT_MS = origSessionTimeout;
@@ -355,29 +364,31 @@ describe('idle session timeout with timers', () => {
       expect(rec.endedByVisibility).toBe(true);
       // Same guarantee: bridge must remain for the rotate signal.
       expect(bridgeCalls).not.toContain('destroy');
+      expect(bridgeCalls).not.toContain('flushAndDestroy');
 
       rec.stop();
-      expect(bridgeCalls).toContain('destroy');
+      expect(bridgeCalls).toContain('flushAndDestroy');
     } finally {
       (Recorder as any).VISIBILITY_GRACE_MS = origGrace;
     }
   });
 
-  test('stop({ keepBridge: true }) skips bridge.destroy() (unit-level)', () => {
+  test('stop({ keepBridge: true }) skips bridge teardown (unit-level)', () => {
     bridgeCalls.length = 0;
     const rec = createRecorder();
     rec.start(true);
     rec.stop({ keepBridge: true });
     expect(bridgeCalls).not.toContain('destroy');
+    expect(bridgeCalls).not.toContain('flushAndDestroy');
     // Flush still fires as part of the stop path (pending events sent).
     expect(bridgeCalls).toContain('flush');
   });
 
-  test('stop() with no args destroys the bridge (default behavior)', () => {
+  test('stop() with no args tears down the bridge via flushAndDestroy (default behavior)', () => {
     bridgeCalls.length = 0;
     const rec = createRecorder();
     rec.start(true);
     rec.stop();
-    expect(bridgeCalls).toContain('destroy');
+    expect(bridgeCalls).toContain('flushAndDestroy');
   });
 });

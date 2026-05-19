@@ -1,4 +1,5 @@
-// Preload: set up browser globals before any module evaluates canUseStorage
+// Preload: set up browser globals (window/document/navigator/localStorage)
+// before any cache module imports run hasLocalStorage() against them.
 
 const storage = new Map<string, string>();
 globalThis.localStorage = {

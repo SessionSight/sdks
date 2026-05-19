@@ -13,6 +13,9 @@ import {
   isEmbeddedMediaUrl,
   filterSrcsetForEmbeddedUrls,
   parseSrcset,
+  buildStableSelector,
+  buildStableDescriptor,
+  serializeDescriptor,
 } from '@sessionsight/sdk-shared';
 import type { SessionMetadata, RecordOptions, PrivacyConfig } from './types.js';
 
@@ -76,6 +79,10 @@ const SERIALIZED_TEXT_TYPE = 3;
  * a stripped naturally-sized image or video finishes loading and we want
  * the replayer to update the corresponding placeholder's `width`/`height`
  * attributes. The replayer's event-cast handler keys off this tag.
+ *
+ * NOTE: apps/ui/src/lib/components/replay/ReplayPlayer.svelte checks the
+ * literal string `'ss_media_dim'` rather than importing this constant, so
+ * any rename here must be mirrored there.
  */
 export const SS_MEDIA_DIM_EVENT = 'ss_media_dim';
 
@@ -124,19 +131,21 @@ interface ScrambleCipher {
 
 function secureRandomInt(maxExclusive: number): number {
   // crypto.getRandomValues is available in every browser the SDK targets,
-  // and in Node 19+ via globalThis. Fall back to Math.random only if a
-  // runtime somehow lacks it, since the previous implementation needed no
-  // randomness at all.
-  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-    // Reject the modulo-biased tail for uniform distribution.
-    const limit = Math.floor(0x100000000 / maxExclusive) * maxExclusive;
-    const buf = new Uint32Array(1);
-    while (true) {
-      crypto.getRandomValues(buf);
-      if (buf[0]! < limit) return buf[0]! % maxExclusive;
-    }
+  // and in Node 19+ via globalThis. Math.random is banned across this
+  // package (worker.ts, transport.ts mirror this) so the scramble cipher's
+  // derangement is never reversible by anyone reading this source. If the
+  // runtime somehow lacks getRandomValues, throw to match generateUUID's
+  // contract; the recorder's caller catches and the SDK degrades safely.
+  if (typeof crypto === 'undefined' || typeof crypto.getRandomValues !== 'function') {
+    throw new Error('SessionSight: crypto.getRandomValues unavailable; cannot generate scramble cipher.');
   }
-  return Math.floor(Math.random() * maxExclusive);
+  // Reject the modulo-biased tail for uniform distribution.
+  const limit = Math.floor(0x100000000 / maxExclusive) * maxExclusive;
+  const buf = new Uint32Array(1);
+  while (true) {
+    crypto.getRandomValues(buf);
+    if (buf[0]! < limit) return buf[0]! % maxExclusive;
+  }
 }
 
 function randomDerangement<T>(input: T[]): T[] {
@@ -234,7 +243,7 @@ function resolveMaskDirective(element: HTMLElement | null): 'mask' | 'unmask' | 
  * data-ss-unmask ancestors, or any other customer configuration. Detects both
  * live `<input type="password">` and rrweb's `data-rr-is-password` marker
  * (set when an input's type was changed away from password during the
- * session — rrweb still treats those values as passwords).
+ * session, rrweb still treats those values as passwords).
  *
  * Exported for tests. Not re-exported from the package index (internal API).
  */
@@ -278,23 +287,33 @@ function maskCacheClear(): void {
  * Apply the privacy masking decision for a given DOM element.
  * Checks data-ss-mask / data-ss-unmask on the element and its ancestors,
  * then falls back to the privacy mode default. Results are cached by
- * (text, directive, privacyMode) to avoid redundant regex + scramble work.
+ * (text, directive, privacyMode, kind) to avoid redundant regex + scramble work.
+ *
+ * `kind` defaults to 'text' (rrweb text-node masking, our DOM-read helpers).
+ * Pass 'input' for form input/textarea values, where we always scramble the
+ * value regardless of privacyMode. Relaxed mode hides form values per the
+ * privacy doc, and unmask attributes never override that floor.
  */
 /**
  * Exported for tests. Not re-exported from the package index (internal API).
  */
-export function applyMasking(text: string, element: HTMLElement | null, privacyMode: string): string {
+export function applyMasking(
+  text: string,
+  element: HTMLElement | null,
+  privacyMode: string,
+  kind: 'text' | 'input' = 'text',
+): string {
   // Password fields are always replaced with [REDACTED]. No directive, privacy
   // mode, or ancestor unmask attribute can override this. Even with the
   // per-session scramble cipher, scrambling a password would still leak its
-  // length and character-class shape — for passwords specifically we drop
+  // length and character-class shape; for passwords specifically we drop
   // both signals.
   if (isPasswordElement(element)) {
     return REDACTED;
   }
 
   const directive = resolveMaskDirective(element);
-  const cacheKey = `${directive ?? 'd'}:${privacyMode}:${text}`;
+  const cacheKey = `${kind}:${directive ?? 'd'}:${privacyMode}:${text}`;
   const cached = maskCacheGet(cacheKey);
   if (cached !== undefined) return cached;
 
@@ -302,7 +321,15 @@ export function applyMasking(text: string, element: HTMLElement | null, privacyM
   // patterns are caught even when text is about to be scrambled.
   let result = redactString(text);
 
-  if (directive === 'mask') {
+  if (kind === 'input') {
+    // Form input values: scramble unconditionally (privacyMode-independent).
+    // The privacy doc promises "Form input values are not captured" in relaxed
+    // mode and inputs are masked in default mode; both reduce to "scramble the
+    // value". data-ss-unmask must NOT opt input values out of scramble: PII
+    // detection is best-effort, and a free-text address field is exactly the
+    // kind of value relaxed mode is supposed to hide.
+    result = scrambleText(result);
+  } else if (directive === 'mask') {
     result = scrambleText(result);
   } else if (directive === 'unmask') {
     // result already has PII redacted, no scramble needed
@@ -327,7 +354,7 @@ type SerializedNode = {
 const PLACEHOLDER_INPUT_TAGS = new Set(['input', 'textarea']);
 
 // Attributes that hold URLs which may contain customer-embedded tokens or
-// PII in their query string. We strip query/fragment from these wholesale —
+// PII in their query string. We strip query/fragment from these wholesale.
 // `src` is excluded because replay needs it to render images/media correctly.
 const URL_ATTRS = ['href', 'action'] as const;
 
@@ -444,13 +471,11 @@ export function maskEventPlaceholders(event: eventWithTime, privacyMode: string)
 
 // ── Media stripping (image, video, audio) ────────────────────────
 //
-// Strips image/video/audio references — both URL refs and embedded bytes
-// (data:/blob: URIs) — from rrweb event payloads before they leave the
+// Strips image/video/audio references (both URL refs and embedded bytes
+// like data:/blob: URIs) from rrweb event payloads before they leave the
 // browser. Layout fidelity is preserved by capturing live element
 // dimensions onto the serialized node before clearing the source. The
 // replayer renders a stand-in via CSS keyed off `data-ss-blocked`.
-//
-// See dev-docs/plans/done/IMAGE_STRIPPING_PLAN.md for the full design.
 
 const MEDIA_TAG_IMG = 'img';
 const MEDIA_TAG_VIDEO = 'video';
@@ -469,7 +494,7 @@ type RrwebMirror = {
  * Resolve `data-ss-allow` for a serialized node. Walks the live DOM via
  * the rrweb mirror so an ancestor opt-in is honored even when the
  * serialized node is a leaf. Returns true if the element OR any ancestor
- * carries the marker (the value is ignored — presence is the signal).
+ * carries the marker (the value is ignored; presence is the signal).
  */
 function isElementOptedIn(id: number | undefined, mirror: RrwebMirror | null): boolean {
   if (id == null || !mirror) return false;
@@ -519,21 +544,38 @@ function captureMediaDimensions(
     intrinsicH = v.videoHeight || 0;
   }
 
-  // Rendered (post-CSS) dimensions are what matter for aspect-ratio
-  // pinning: that's what the customer actually sees at this moment.
-  // Intrinsic dims drive the size when height:auto is in play, so use
-  // intrinsic for aspect when available; fall back to the rendered box
-  // when intrinsic is unknown (media not loaded yet).
+  // Capture the rendered (post-CSS) box at serialize time. We pin both
+  // axes as inline px declarations so the replay element renders at
+  // EXACTLY the size the customer's CSS resolved to on the live page,
+  // independent of whether the image had loaded, whether `height: auto`
+  // was in play, whether intrinsic dims survived (the SVG shim's 1:1
+  // viewBox would otherwise dominate when CSS used auto). Without this
+  // pin, missing intrinsics + auto sizing made shim elements collapse
+  // or stretch, shifting every section below them and breaking
+  // cursor-position alignment at click time.
+  //
+  // Inline styles win over stylesheet rules of equal specificity, so
+  // the customer's `width: 100%; height: auto` no longer applies to
+  // the shimmed element in replay. The replay iframe sizes to the
+  // recorded viewport, so locked pixel dims are accurate, not stale.
+  let renderedW = 0;
+  let renderedH = 0;
+  try {
+    const rect = liveEl.getBoundingClientRect();
+    renderedW = Math.round(rect.width);
+    renderedH = Math.round(rect.height);
+  } catch {
+    // ignore. Better to ship without dims than to throw.
+  }
+
+  // Aspect-ratio fallback. Prefer intrinsic (matches the natural
+  // proportions of the asset) over rendered (which could be distorted
+  // by CSS object-fit etc.). Rendered is the safety net.
   let aspectW = intrinsicW;
   let aspectH = intrinsicH;
   if (aspectW === 0 || aspectH === 0) {
-    try {
-      const rect = liveEl.getBoundingClientRect();
-      aspectW = aspectW || Math.round(rect.width);
-      aspectH = aspectH || Math.round(rect.height);
-    } catch {
-      // ignore — better to ship without dims than to throw
-    }
+    aspectW = aspectW || renderedW;
+    aspectH = aspectH || renderedH;
   }
 
   // Don't overwrite explicit width/height already set by the customer.
@@ -542,15 +584,30 @@ function captureMediaDimensions(
   if (intrinsicW > 0 && !hasWidth) attrs.width = String(intrinsicW);
   if (intrinsicH > 0 && !hasHeight) attrs.height = String(intrinsicH);
 
-  // Pin aspect-ratio inline so the shim's 1:1 intrinsic doesn't rewrite
-  // the visible aspect. Skip when we can't determine an aspect, and
-  // when the customer's inline style already declares one.
-  if (aspectW > 0 && aspectH > 0) {
-    const existingStyle = typeof attrs.style === 'string' ? attrs.style : '';
-    if (!/(^|;)\s*aspect-ratio\s*:/i.test(existingStyle)) {
-      const sep = existingStyle.length > 0 && !existingStyle.trim().endsWith(';') ? '; ' : '';
-      attrs.style = `${existingStyle}${sep}aspect-ratio: ${aspectW} / ${aspectH}`;
-    }
+  // Build the inline style additions. aspect-ratio first (cheap; only
+  // when we have one and customer didn't set one). Then the rendered
+  // pixel dimensions: these are the load-bearing fix for click /
+  // cursor alignment in replay. Don't overwrite if the customer's
+  // inline style already pins a property.
+  let style = typeof attrs.style === 'string' ? attrs.style : '';
+  const hasAspectInline = /(^|;)\s*aspect-ratio\s*:/i.test(style);
+  const hasWidthInline = /(^|;)\s*width\s*:/i.test(style);
+  const hasHeightInline = /(^|;)\s*height\s*:/i.test(style);
+  const append = (decl: string) => {
+    const sep = style.length > 0 && !style.trim().endsWith(';') ? '; ' : '';
+    style = `${style}${sep}${decl}`;
+  };
+  if (aspectW > 0 && aspectH > 0 && !hasAspectInline) {
+    append(`aspect-ratio: ${aspectW} / ${aspectH}`);
+  }
+  if (renderedW > 0 && !hasWidthInline) {
+    append(`width: ${renderedW}px`);
+  }
+  if (renderedH > 0 && !hasHeightInline) {
+    append(`height: ${renderedH}px`);
+  }
+  if (style !== (typeof attrs.style === 'string' ? attrs.style : '')) {
+    attrs.style = style;
   }
 }
 
@@ -578,12 +635,12 @@ function absolutifyUrl(value: string): string {
  * survives if opted in; embedded forms (data:/blob:) strip unconditionally.
  *
  * Returns one of:
- *   { kind: 'keep', value }         — write `value` back to the attribute
+ *   { kind: 'keep', value }         : write `value` back to the attribute
  *                                      (URL absolutified so the replay
  *                                      iframe can fetch from the customer's
  *                                      origin even though the iframe runs
  *                                      under SessionSight's origin)
- *   { kind: 'shim' }                — replace with SS_MEDIA_SHIM (so the
+ *   { kind: 'shim' }                : replace with SS_MEDIA_SHIM (so the
  *                                      browser doesn't render a broken-image
  *                                      icon under the replayer's stand-in)
  */
@@ -629,7 +686,7 @@ function applyMediaOptInSrcset(value: string, optIn: boolean): string {
  * Marker policy (`data-ss-blocked`): set whenever the resulting element
  * will render the SS_MEDIA_SHIM placeholder. This includes cases where
  * an opted-in element had a `data:`/`blob:` source (which strips
- * unconditionally) — opt-in does not suppress the marker, only the strip.
+ * unconditionally); opt-in does not suppress the marker, only the strip.
  * The replayer's stand-in CSS keys off this marker.
  *
  * `data-ss-allow` inheritance: when the marker is inherited from an
@@ -679,7 +736,7 @@ function scrubMediaElement(
     if (typeof v !== 'string' || v.length === 0) return;
     const next = applyMediaOptInSrcset(v, optIn);
     if (next !== v) {
-      // srcset is a candidate list — don't shim individual entries; clear
+      // srcset is a candidate list. Don't shim individual entries; clear
       // the whole attribute. The element's `src` (or fallback) is what
       // determines whether we need a stand-in.
       attrs[name] = next;
@@ -809,7 +866,7 @@ function scrubMedia(node: SerializedNode | null | undefined, mirror: RrwebMirror
 }
 
 /**
- * Apply media-strip rules to the `mutations.attributes` delta array — the
+ * Apply media-strip rules to the `mutations.attributes` delta array, the
  * rrweb shape for incremental attribute mutations on existing elements.
  * No node tree available; we look up the live element via the mirror to
  * read tagName + opt-in state.
@@ -879,6 +936,26 @@ function scrubMediaAttributeDeltas(
       }
     }
 
+    // Re-pin rendered dimensions on every IMG/VIDEO style mutation.
+    // Customer pages frequently call `element.style.setProperty('--foo', x)`
+    // on media elements at 60Hz (scroll-driven transforms, animations, etc).
+    // rrweb's MutationObserver capture records the FULL post-mutation
+    // style attribute on every change. Crucially, the
+    // width/height/aspect-ratio we appended at FullSnapshot time were
+    // added to the SERIALIZED snapshot, never written back to the live
+    // element. So when JS later mutates the live element's style, the
+    // resulting mutation event contains only the customer's declarations
+    // (e.g. `--flip-progress: 1`) and overwrites our pin in the replay.
+    // Without these dims the replay falls through to the SS_MEDIA_SHIM's
+    // 1:1 SVG intrinsic. Landscape images render as squares and shift
+    // every section below them downward. Re-inject the pin from the
+    // live element's current layout box on each style mutation so the
+    // captured stream always carries them.
+    if (('style' in attrs) && (tag === MEDIA_TAG_IMG || tag === MEDIA_TAG_VIDEO)) {
+      const baseStyle = typeof attrs.style === 'string' ? attrs.style : '';
+      attrs.style = repinMediaDimensions(baseStyle, liveEl as HTMLElement);
+    }
+
     if (typeof attrs._cssText === 'string' && attrs._cssText.length > 0) {
       const out = { stripped: false };
       const next = stripStylesheetUrls(attrs._cssText, out);
@@ -892,6 +969,52 @@ function scrubMediaAttributeDeltas(
       attrs[SS_BLOCKED_ATTR] = '';
     }
   }
+}
+
+/**
+ * Ensure `width: Xpx; height: Ypx; aspect-ratio: W/H` are present in an
+ * IMG/VIDEO's style attribute, reading the dimensions from the live
+ * element's layout box (`offsetWidth`/`offsetHeight`, pre-transform, so
+ * a rotated card-image still reports its real layout size, not its
+ * rotated AABB). Preserves every existing declaration the caller passed
+ * in; only adds missing ones. See the comment at the call site in
+ * `scrubMediaAttributeDeltas` for why this runs on every mutation.
+ */
+function repinMediaDimensions(style: string, liveEl: HTMLElement | null): string {
+  if (!liveEl) return style;
+  const w = (liveEl as HTMLElement).offsetWidth;
+  const h = (liveEl as HTMLElement).offsetHeight;
+  if (w <= 0 || h <= 0) return style;
+
+  let intrinsicW = 0;
+  let intrinsicH = 0;
+  const tag = liveEl.tagName.toLowerCase();
+  if (tag === MEDIA_TAG_IMG) {
+    const img = liveEl as HTMLImageElement;
+    intrinsicW = img.naturalWidth || 0;
+    intrinsicH = img.naturalHeight || 0;
+  } else if (tag === MEDIA_TAG_VIDEO) {
+    const v = liveEl as HTMLVideoElement;
+    intrinsicW = v.videoWidth || 0;
+    intrinsicH = v.videoHeight || 0;
+  }
+  const aspectW = intrinsicW || w;
+  const aspectH = intrinsicH || h;
+
+  let next = style;
+  const hasAspect = /(^|;)\s*aspect-ratio\s*:/i.test(next);
+  const hasWidth = /(^|;)\s*width\s*:/i.test(next);
+  const hasHeight = /(^|;)\s*height\s*:/i.test(next);
+  const append = (decl: string) => {
+    const sep = next.length > 0 && !next.trim().endsWith(';') ? '; ' : '';
+    next = `${next}${sep}${decl}`;
+  };
+  if (!hasAspect && aspectW > 0 && aspectH > 0) {
+    append(`aspect-ratio: ${aspectW} / ${aspectH}`);
+  }
+  if (!hasWidth) append(`width: ${w}px`);
+  if (!hasHeight) append(`height: ${h}px`);
+  return next;
 }
 
 /**
@@ -926,7 +1049,7 @@ function scrubStyleSheetRule(data: any): void {
 /**
  * Strip url() refs from an `IncrementalSource.StyleDeclaration` event
  * payload. Only acts on URL-bearing CSS properties; honors `data-ss-allow`
- * on the target live element (URL form only — data:/blob: still strip).
+ * on the target live element (URL form only; data:/blob: still strip).
  */
 function scrubStyleDeclaration(data: any, mirror: RrwebMirror | null): void {
   if (!data || typeof data !== 'object') return;
@@ -1032,6 +1155,125 @@ function matchesAnyPattern(path: string, patterns: RegExp[]): boolean {
   return false;
 }
 
+/**
+ * Serialize every `@font-face` rule from the live document by walking
+ * `document.styleSheets` and reading each descriptor individually via
+ * `style.getPropertyValue(name)`. This is deliberately NOT the obvious
+ * paths:
+ *
+ *   - `CSSFontFaceRule.cssText`: the browser's stock serialization that
+ *     rrweb's `inlineStylesheet: true` capture relies on. In some
+ *     browsers it silently drops modern descriptors (`size-adjust`,
+ *     `ascent-override`, `descent-override`, `line-gap-override`), which
+ *     leaves the replay rendering text with different glyph metrics than
+ *     the live page. Wrap points drift, bolds collapse to non-bold,
+ *     clicks land offset from their targets.
+ *
+ *   - `document.fonts` (FontFaceSet) + `FontFace.src`: clean per-property
+ *     access, but in Chromium `FontFace.src` returns an empty string for
+ *     FontFace objects whose descriptors were populated by the CSS
+ *     parser (as opposed to `new FontFace()`). An @font-face emitted
+ *     without `src` is invalid CSS and gets dropped, so the metric
+ *     overrides never activate even though they round-tripped fine.
+ *
+ * `getPropertyValue` per-descriptor on `CSSFontFaceRule.style` returns
+ * the originally-declared string for every descriptor including `src`,
+ * sidestepping both bugs. The recorder emits the resulting text as an
+ * `ss_fonts` custom event; the replayer appends it as a `<style>` to
+ * the iframe head after every FullSnapshot rebuild so its rules win the
+ * cascade over anything lossy that rrweb captured.
+ */
+async function serializeDocumentFonts(): Promise<string> {
+  if (typeof document === 'undefined' || !document.styleSheets) return '';
+  const blocks: string[] = [];
+  const descriptors = [
+    'font-family',
+    'src',
+    'font-style',
+    'font-weight',
+    'font-stretch',
+    'font-display',
+    'unicode-range',
+    'ascent-override',
+    'descent-override',
+    'line-gap-override',
+    'size-adjust',
+  ];
+  // Hrefs of stylesheets that threw on cssRules access. Almost always a
+  // `<link rel="stylesheet">` to a third-party CDN (Google Fonts is the
+  // canonical example) loaded without `crossorigin="anonymous"`. The
+  // browser fetched and applied the CSS but blocks JS from reading its
+  // rules. Re-fetching with `fetch()` is a separate CORS path that the
+  // server side (gstatic, etc.) generally allows, so we can recover the
+  // @font-face blocks from the response text.
+  const fetchList: string[] = [];
+  const collectFromSheet = (sheet: CSSStyleSheet) => {
+    let rules: CSSRuleList | null = null;
+    try {
+      rules = sheet.cssRules;
+    } catch {
+      if (sheet.href) fetchList.push(sheet.href);
+      return;
+    }
+    if (!rules) return;
+    for (const rule of Array.from(rules)) {
+      if (rule.type === 5) {
+        const ffRule = rule as CSSFontFaceRule;
+        const style = ffRule.style;
+        const parts: string[] = [];
+        for (const name of descriptors) {
+          const value = style.getPropertyValue(name);
+          if (typeof value === 'string' && value.length > 0) {
+            parts.push(`${name}: ${value}`);
+          }
+        }
+        const hasFamily = parts.some((p) => p.startsWith('font-family:'));
+        const hasSrc = parts.some((p) => p.startsWith('src:'));
+        if (hasFamily && hasSrc) {
+          blocks.push(`@font-face { ${parts.join('; ')} }`);
+        }
+        continue;
+      }
+      if (rule.type === 3) {
+        const imported = (rule as CSSImportRule).styleSheet;
+        if (imported) collectFromSheet(imported);
+      }
+    }
+  };
+  try {
+    for (const sheet of Array.from(document.styleSheets)) {
+      collectFromSheet(sheet);
+    }
+  } catch {
+    return '';
+  }
+  if (fetchList.length > 0) {
+    // Naive but reliable: parse @font-face blocks from the CSS text via
+    // regex. CDN-served font CSS doesn't use nested braces inside an
+    // @font-face declaration, so a single-level brace match is enough.
+    // `credentials: 'omit'` keeps cookies/auth out of the request so the
+    // server treats it as a public CSS fetch.
+    const FONT_FACE_BLOCK = /@font-face\s*\{[^}]+\}/g;
+    await Promise.all(
+      fetchList.map(async (href) => {
+        try {
+          const res = await fetch(href, { credentials: 'omit' });
+          if (!res.ok) return;
+          const text = await res.text();
+          const matches = text.match(FONT_FACE_BLOCK);
+          if (matches) {
+            for (const m of matches) blocks.push(m);
+          }
+        } catch {
+          // Network/CORS failure; skip silently. The replay will fall
+          // back to whatever the lossy inline-stylesheet capture has.
+        }
+      }),
+    );
+  }
+  return blocks.join('\n');
+}
+
 export class Recorder {
   private bridge: WorkerBridge;
   private visitorId: string;
@@ -1042,9 +1284,12 @@ export class Recorder {
   // emit a SessionSight-internal aspect-ratio update event whenever the
   // box reflows in the original session. See installPendingMediaDimListeners.
   private mediaResizeObserver: ResizeObserver | null = null;
-  private stableId: string | null = null;
-  private userProperties: Record<string, string | number | boolean> = {};
-  private userPropertiesDirty = false;
+  // Cached identity slots, used solely to detect whether the next
+  // identify() call changes them. The WorkerBridge keeps its own
+  // authoritative copy (plus the dirty flag and the customProperties
+  // accumulator) since it's the one that builds the flush payload.
+  private identifyId: string | null = null;
+  private identifyEmail: string | null = null;
   private lastHref: string = '';
   private lastEmittedFlagToken: string | null = null;
   private flagCheckTimer: ReturnType<typeof setInterval> | null = null;
@@ -1082,6 +1327,22 @@ export class Recorder {
   private lastScrollDirection: 'up' | 'down' | null = null;
   private lastScrollY = 0;
 
+
+  // Cache for the overflow-check + selector pair per Element. Walking the
+  // ancestor chain on every click + every move sample would call
+  // getComputedStyle on 5-10 elements; the WeakMap drops naturally when
+  // elements are GC'd, and rage-click bursts (3+ clicks/sec) reuse the
+  // entry on subsequent calls.
+  private scrollableCache: WeakMap<Element, { scrollable: boolean; selector: string }> = new WeakMap();
+
+  // Per-target throttle for container_scroll_depth emits (150ms). Keyed
+  // by the innermost scrollable element so a viewer scrolling two panels
+  // in quick succession emits one event per panel per window. The map is
+  // bounded by the small number of scrollable containers a page actually
+  // has at any time.
+  private containerScrollLastEmit: WeakMap<Element, number> = new WeakMap();
+  private static readonly CONTAINER_SCROLL_THROTTLE_MS = 150;
+
   // Frustration signal: form field retries
   private fieldFocusCounts = new Map<string, number[]>();
 
@@ -1095,6 +1356,17 @@ export class Recorder {
   private idleSessionTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly IDLE_SESSION_TIMEOUT_MS = 300_000; // 5 minutes
   public endedByIdle = false;
+
+  // Text-selection debounce. `selectionchange` fires on every mouse move
+  // during a drag-select, so we wait for the gesture to settle before
+  // emitting. `lastTextSelectionText` deduplicates consecutive emits of
+  // the same selection (e.g., shift-click extension that lands on the
+  // same endpoints, or a pause-resume during the drag) and resets when
+  // the selection collapses so re-selecting the same text emits again.
+  private textSelectDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastTextSelectionText = '';
+  private static readonly TEXT_SELECT_DEBOUNCE_MS = 300;
+  private static readonly TEXT_SELECT_MAX_LEN = 200;
 
   // Error deduplication state
   private lastErrorMessage = '';
@@ -1134,6 +1406,13 @@ export class Recorder {
       this.isRecording = false;
       if (this.stopRrweb) { this.stopRrweb(); this.stopRrweb = null; }
     });
+
+    // The bridge's bootstrap recovery path can swap visitorId mid-session if
+    // the server refuses to reuse our cached id. Mirror it here so
+    // getVisitorId() (a documented public API) returns the live value.
+    this.bridge.onVisitorIdSwap((newVisitorId) => {
+      this.visitorId = newVisitorId;
+    });
   }
 
   start(autoRecord: boolean): void {
@@ -1150,10 +1429,10 @@ export class Recorder {
         this.bridge.postMetadata(this.collectMetadata());
       }
 
-      // Always start rrweb — events go to either buffer or preBuffer.
+      // Always start rrweb. Events go to either buffer or preBuffer.
       // rrweb's record() emits its own Meta event (type 4) with href,
       // so the initial page automatically appears in the pages list.
-      // Do NOT emit a second Meta event here — it would land after the
+      // Do NOT emit a second Meta event here. It would land after the
       // FullSnapshot in the buffer, causing discardPriorSnapshots() to
       // skip the FullSnapshot on backward seeks and break replay.
       // startRrweb is async (rrweb is lazy-loaded) but we don't await it:
@@ -1177,6 +1456,7 @@ export class Recorder {
       document.addEventListener('submit', this.handleFormSubmit, true);
       document.addEventListener('focusin', this.handleFieldFocus, true);
       document.addEventListener('focusout', this.handleFieldBlur, true);
+      document.addEventListener('selectionchange', this.handleSelectionChange);
 
       // Heatmap tracking
       document.addEventListener('click', this.handleHeatmapClick, true);
@@ -1186,7 +1466,7 @@ export class Recorder {
       // Media playback fallback: clicks on native <video>/<audio> controls
       // (the play button, scrubber, volume slider) live inside a closed
       // user-agent shadow DOM. Many browsers absorb those clicks so they
-      // never propagate to document — both our heatmap listener and
+      // never propagate to document. Both our heatmap listener and
       // rrweb's MouseInteraction listener miss them entirely. Listen
       // directly for `play`/`pause` events on each media element and
       // synthesize a click on the host element when the corresponding
@@ -1293,6 +1573,11 @@ export class Recorder {
     document.removeEventListener('submit', this.handleFormSubmit, true);
     document.removeEventListener('focusin', this.handleFieldFocus, true);
     document.removeEventListener('focusout', this.handleFieldBlur, true);
+    document.removeEventListener('selectionchange', this.handleSelectionChange);
+    if (this.textSelectDebounceTimer) {
+      clearTimeout(this.textSelectDebounceTimer);
+      this.textSelectDebounceTimer = null;
+    }
 
     document.removeEventListener('click', this.handleHeatmapClick, true);
     document.removeEventListener('mousemove', this.handleHeatmapMouseMove, { capture: true } as EventListenerOptions);
@@ -1309,12 +1594,16 @@ export class Recorder {
     document.removeEventListener('visibilitychange', this.handleVisibilityChange);
     window.removeEventListener('beforeunload', this.handleBeforeUnload);
 
-    if (this.isRecording) {
-      this.bridge.flush();
-    }
+    const wasRecording = this.isRecording;
     this.isRecording = false;
     if (!options.keepBridge) {
-      this.bridge.destroy();
+      // flushAndDestroy posts flush-final to the worker (HTTP keepalive) so
+      // events on the way out aren't dropped by terminate(). Plain
+      // bridge.flush() + bridge.destroy() raced against the worker picking
+      // up the flush message before terminate killed it.
+      this.bridge.flushAndDestroy();
+    } else if (wasRecording) {
+      this.bridge.flush();
     }
     maskCacheClear();
   }
@@ -1331,14 +1620,40 @@ export class Recorder {
     return this.propertyId;
   }
 
-  identify(stableId: string, properties?: Record<string, string | number | boolean>): void {
-    this.stableId = stableId;
-    this.bridge.postIdentify(stableId, properties);
-    if (properties) {
-      Object.assign(this.userProperties, properties);
-      this.userPropertiesDirty = true;
-      this.emitCustomEvent('set_user_properties', { ...properties });
+  /**
+   * Detect changes to the identity slots and forward the parsed payload
+   * to the WorkerBridge. Also emit a `set_user_properties` custom event
+   * so the workflow runtime sees the change in the recorded event stream.
+   *
+   * Payload is already validated and normalized at the SDK entry. The
+   * Recorder only tracks identifyId/identifyEmail to compute the
+   * `identityChanged` flag; the WorkerBridge owns the authoritative
+   * cache + dirty tracking for the next flush.
+   */
+  identify(payload: { id?: string; email?: string; customProperties?: Record<string, string | number | boolean> }): void {
+    let identityChanged = false;
+    if (payload.id !== undefined && payload.id !== this.identifyId) {
+      this.identifyId = payload.id;
+      identityChanged = true;
     }
+    if (payload.email !== undefined && payload.email !== this.identifyEmail) {
+      this.identifyEmail = payload.email;
+      identityChanged = true;
+    }
+
+    if (payload.customProperties && Object.keys(payload.customProperties).length > 0) {
+      // Emit a recorded custom event so the workflow runtime sees the
+      // change in the event stream. The WorkerBridge handles caching +
+      // dirty tracking for the next flush.
+      this.emitCustomEvent('set_user_properties', { ...payload.customProperties });
+    }
+
+    this.bridge.postIdentify({
+      id: this.identifyId,
+      email: this.identifyEmail,
+      customProperties: payload.customProperties,
+      identityChanged,
+    });
   }
 
   /**
@@ -1398,8 +1713,8 @@ export class Recorder {
   /**
    * Observe the rendered size of every `<img>`, `<video>`, and SVG
    * `<image>` element with a `ResizeObserver`. When the rendered size
-   * changes — image load completes, video metadata arrives, the user
-   * resizes the window, a CSS class swap re-aspects the box — emit a
+   * changes (image load completes, video metadata arrives, the user
+   * resizes the window, a CSS class swap re-aspects the box), emit a
    * SessionSight-internal custom rrweb event carrying the new
    * dimensions. The replayer applies them as inline `aspect-ratio` and
    * `width`/`height` attributes at the captured timestamp, reproducing
@@ -1462,7 +1777,7 @@ export class Recorder {
       // `<img>`, `<video>`, and SVG `<image>` are the foreground media
       // tags whose visible size we strip the source from. `<audio>`
       // renders its own native controls (no media-frame area) and
-      // doesn't need aspect tracking — the controls' rendered size is
+      // doesn't need aspect tracking. The controls' rendered size is
       // entirely customer-CSS-driven.
       const observe = (selector: string) => {
         const els = document.querySelectorAll(selector);
@@ -1499,7 +1814,7 @@ export class Recorder {
           try {
             // Scramble placeholder attributes in serialized nodes before buffering
             maskEventPlaceholders(event, privacyMode);
-            // Strip image/video/audio refs (default-on; see IMAGE_STRIPPING_PLAN).
+            // Strip image/video/audio refs (default-on).
             // record.mirror is the runtime serialization map; lookups by
             // serialized node id return the live DOM element, which we read
             // for dimensions and `data-ss-allow` ancestry.
@@ -1522,11 +1837,14 @@ export class Recorder {
         // Replace excluded elements with empty placeholders (preserves inline styles)
         blockSelector: '[data-ss-exclude]',
 
-        // Mask all input values, with custom logic respecting data-ss attributes
+        // Mask all input values, with custom logic respecting data-ss attributes.
+        // Pass kind='input' so the value is always scrambled regardless of
+        // privacyMode or unmask directives (the privacy doc promises form
+        // values are not captured in relaxed mode; password floor still wins).
         maskAllInputs: true,
         maskInputFn: (text: string, element: HTMLElement): string => {
           try {
-            return applyMasking(text, element, privacyMode);
+            return applyMasking(text, element, privacyMode, 'input');
           } catch (e) {
             console.warn('SessionSight: error in maskInputFn', e);
             return text;
@@ -1551,6 +1869,21 @@ export class Recorder {
       // replayer applies as a width/height update at that timestamp.
       // No live-DOM mutation, no bootstrap delay.
       this.installPendingMediaDimListeners(record);
+
+      // Capture @font-face declarations from the live document's
+      // stylesheets so the replayer can render text with the same metrics
+      // (and the same actual webfont files) as the live page. The fetch
+      // step inside serializeDocumentFonts recovers @font-face blocks
+      // from cross-origin link stylesheets (Google Fonts and friends)
+      // whose rules can't be read via CSSOM. See the function comment
+      // above for why neither rrweb's inline-stylesheet capture nor the
+      // FontFace API alone is enough. Fire-and-forget so the await
+      // doesn't block the rest of recorder bring-up.
+      void serializeDocumentFonts().then((fontCss) => {
+        if (fontCss.length > 0) {
+          this.emitCustomEvent('ss_fonts', { css: fontCss });
+        }
+      });
     } catch (e) {
       console.warn('SessionSight: failed to start rrweb', e);
     }
@@ -1802,6 +2135,96 @@ export class Recorder {
     }
   };
 
+  // ── Text selection ─────────────────────────────────────────────────
+  //
+  // `selectionchange` is the only DOM event that catches every selection
+  // path uniformly: mouse drag-select, double/triple-click word/paragraph
+  // select, keyboard shift-arrow, and programmatic selection. It fires
+  // continuously during a drag, so we debounce until the gesture settles
+  // before emitting.
+  //
+  // We deliberately do NOT capture the selected text content, only
+  // structural indicators (length, target element, viewport position).
+  // The "what was selected" signal we care about is "the user paid
+  // attention to this region of the page", not the literal characters.
+  // Capturing characters would leak PII from any page that displays
+  // user data (account names, emails, anything inside a card the user
+  // happened to drag-select). A stable selector for the anchor element
+  // tells the analyst WHERE the selection happened without ever seeing
+  // the content.
+
+  private handleSelectionChange = (): void => {
+    if (this.textSelectDebounceTimer) clearTimeout(this.textSelectDebounceTimer);
+    this.textSelectDebounceTimer = setTimeout(() => {
+      this.textSelectDebounceTimer = null;
+      this.emitTextSelection();
+    }, Recorder.TEXT_SELECT_DEBOUNCE_MS);
+  };
+
+  private emitTextSelection(): void {
+    try {
+      const sel = typeof window !== 'undefined' && window.getSelection ? window.getSelection() : null;
+      if (!sel) return;
+      // A collapsed selection (no range, or cursor placement with no
+      // highlight) clears the dedupe stamp so a re-selection of the
+      // same region in a later gesture still emits.
+      if (sel.isCollapsed) {
+        this.lastTextSelectionText = '';
+        return;
+      }
+      // toString() is read once locally to derive length + dedupe key;
+      // the string itself never leaves this function.
+      const rawText = sel.toString();
+      const trimmedLen = rawText.trim().length;
+      if (trimmedLen === 0) return;
+      if (rawText === this.lastTextSelectionText) return;
+      this.lastTextSelectionText = rawText;
+
+      // Resolve the anchor node's nearest element so the captured
+      // selector points at HTML, not a text node.
+      let anchorEl: HTMLElement | null = null;
+      const anchorNode = sel.anchorNode;
+      if (anchorNode) {
+        anchorEl = (anchorNode.nodeType === 1 ? anchorNode : anchorNode.parentNode) as HTMLElement | null;
+      }
+      const selector = anchorEl ? buildStableSelector(anchorEl) : '';
+
+      // Visual center of the selection rectangle so the replayer can
+      // render a marker at the right spot. getBoundingClientRect on
+      // the first range is the union of every line box, so a multi-line
+      // selection still centers sensibly.
+      let viewportX = 0;
+      let viewportY = 0;
+      try {
+        const rect = sel.getRangeAt(0).getBoundingClientRect();
+        viewportX = Math.round(rect.left + rect.width / 2);
+        viewportY = Math.round(rect.top + rect.height / 2);
+      } catch {
+        // Defensive: getRangeAt(0) can throw if the range was torn down.
+      }
+
+      // Bucket the length so even the count doesn't accidentally
+      // fingerprint individual values typed into a field. Buckets are
+      // log-style for "this was a word vs a paragraph" granularity.
+      const lengthBucket =
+        trimmedLen < 20 ? 'short'
+        : trimmedLen < 100 ? 'medium'
+        : trimmedLen < 500 ? 'long'
+        : 'paragraph';
+
+      this.emitCustomEvent('text_select', {
+        page: stripUrlQuery(window.location.pathname),
+        elementTag: anchorEl?.tagName?.toLowerCase() || '',
+        selector,
+        lengthBucket,
+        viewportX,
+        viewportY,
+      });
+    } catch (e) {
+      console.warn('SessionSight: error in text-selection handler', e);
+    }
+  }
+
   // ── Heatmap tracking ───────────────────────────────────────────────
 
   private static readonly INTERACTIVE_SELECTOR = [
@@ -1811,7 +2234,7 @@ export class Recorder {
     // volume) inside a closed shadow DOM. Clicks on those internal buttons
     // retarget up to the host element. Without including the host here,
     // every play/pause click would fall through to the dead-click defer and
-    // be misclassified — internal mutations in the media-controls shadow
+    // be misclassified. Internal mutations in the media-controls shadow
     // DOM don't propagate to our document-level MutationObserver, so the
     // 400ms deferred check would always conclude "no mutation, no
     // interaction".
@@ -1837,6 +2260,130 @@ export class Recorder {
 
   private static readonly DEAD_CLICK_DEFER_MS = 400;
 
+  /**
+   * Check whether `el` is a scrollable container (overflow auto/scroll +
+   * actual scrollable content). Cached per-Element via WeakMap so repeated
+   * clicks/moves don't pay the getComputedStyle cost.
+   *
+   * The selector is computed eagerly with the scrollable check because it
+   * is only consulted for scrollable elements anyway; storing both
+   * together avoids a second WeakMap.
+   */
+  private isScrollable(el: Element): { scrollable: boolean; selector: string } {
+    const cached = this.scrollableCache.get(el);
+    if (cached) return cached;
+    let scrollable = false;
+    try {
+      const style = window.getComputedStyle(el);
+      const overflowY = style.overflowY;
+      const overflowX = style.overflowX;
+      const yScrolls = (overflowY === 'auto' || overflowY === 'scroll') && (el as HTMLElement).scrollHeight > (el as HTMLElement).clientHeight;
+      const xScrolls = (overflowX === 'auto' || overflowX === 'scroll') && (el as HTMLElement).scrollWidth > (el as HTMLElement).clientWidth;
+      scrollable = yScrolls || xScrolls;
+    } catch {
+      scrollable = false;
+    }
+    // Skip selector cost for non-scrollable elements; we still want to
+    // memoize the "not scrollable" answer so the next click on the same
+    // element doesn't recompute.
+    const selector = scrollable ? buildStableSelector(el) : '';
+    const entry = { scrollable, selector };
+    this.scrollableCache.set(el, entry);
+    return entry;
+  }
+
+  /**
+   * Walk the ancestor chain from `target` to <html>, recording scrollable
+   * ancestors with their scroll offsets and dimensions. Index 0 is the
+   * innermost scrollable; the last entry is the outermost.
+   *
+   * Containers inside customer-marked private subtrees (data-ss-mask) are
+   * skipped. The customer asked us not to capture their content, which
+   * includes scroll positions in those subtrees.
+   *
+   * Returns `{ scrollContext, containerOffset }`. `containerOffset` is the
+   * absolute pixel offset of the click/move within the innermost
+   * scrollable container's full content (xPx + container.scrollLeft,
+   * yPx + container.scrollTop). Returns nulls when there is no
+   * scrollable ancestor.
+   */
+  private buildScrollContext(
+    target: HTMLElement | null,
+    clientX: number,
+    clientY: number,
+  ): {
+    scrollContext: Array<{ selector: string; scrollTop: number; scrollLeft: number; scrollHeight: number; clientHeight: number }>;
+    containerOffset: { xPx: number; yPx: number } | null;
+  } {
+    const scrollContext: Array<{ selector: string; scrollTop: number; scrollLeft: number; scrollHeight: number; clientHeight: number }> = [];
+    let containerOffset: { xPx: number; yPx: number } | null = null;
+    if (!target) return { scrollContext, containerOffset };
+
+    let cursor: Element | null = target;
+    while (cursor && cursor !== document.documentElement) {
+      // Skip private subtrees: if any ancestor between cursor and the
+      // target is data-ss-mask, we treat that entire branch as opaque.
+      if (
+        cursor.hasAttribute && (
+          cursor.hasAttribute('data-ss-mask') ||
+          cursor.hasAttribute('data-rr-is-password')
+        )
+      ) {
+        // Anything from here up is excluded from the chain.
+        break;
+      }
+      const { scrollable, selector } = this.isScrollable(cursor);
+      if (scrollable && selector) {
+        const el = cursor as HTMLElement;
+        const rect = el.getBoundingClientRect();
+        scrollContext.push({
+          selector,
+          scrollTop: el.scrollTop,
+          scrollLeft: el.scrollLeft,
+          scrollHeight: el.scrollHeight,
+          clientHeight: el.clientHeight,
+        });
+        // First (innermost) scrollable defines the containerOffset.
+        if (containerOffset === null) {
+          containerOffset = {
+            xPx: Math.round((clientX - rect.left) + el.scrollLeft),
+            yPx: Math.round((clientY - rect.top) + el.scrollTop),
+          };
+        }
+      }
+      cursor = cursor.parentElement;
+    }
+    return { scrollContext, containerOffset };
+  }
+
+  /**
+   * Handle a scroll event whose target is an Element (not document/window).
+   * Emits a throttled `container_scroll_depth` event for the innermost
+   * scrollable target. Skips elements marked data-ss-mask.
+   */
+  private handleContainerScroll(target: Element): void {
+    if (!target || target === document.documentElement) return;
+    if (
+      (target as HTMLElement).closest?.('[data-ss-mask], [data-rr-is-password]') !== null
+    ) return;
+    const now = Date.now();
+    const last = this.containerScrollLastEmit.get(target) || 0;
+    if (now - last < Recorder.CONTAINER_SCROLL_THROTTLE_MS) return;
+    this.containerScrollLastEmit.set(target, now);
+
+    const { scrollable, selector } = this.isScrollable(target);
+    if (!scrollable || !selector) return;
+    const el = target as HTMLElement;
+    this.emitCustomEvent('container_scroll_depth', {
+      selector,
+      scrollTop: el.scrollTop,
+      scrollLeft: el.scrollLeft,
+      scrollHeight: el.scrollHeight,
+      clientHeight: el.clientHeight,
+      page: stripUrlQuery(window.location.pathname),
+    });
+  }
+
   private handleHeatmapClick = (e: MouseEvent): void => {
     try {
       const target = e.target as HTMLElement | null;
@@ -1845,7 +2392,7 @@ export class Recorder {
         try { cursor = window.getComputedStyle(target).cursor; } catch {}
       }
       // Selection gesture (reading, double/triple-click word/paragraph select):
-      // ignore entirely — not an interaction attempt, would otherwise pollute
+      // ignore entirely. Not an interaction attempt; would otherwise pollute
       // dead-click counts and rage-click clusters.
       if (cursor === 'text') return;
       // Cooldown stamp for the media-playback synth-click fallback. When a
@@ -1889,7 +2436,30 @@ export class Recorder {
       const text = this.maskText(rawText, el as HTMLElement | null);
       const href = stripUrlQuery((el as HTMLAnchorElement)?.href || '');
 
-      const clickData = {
+      // Stable descriptor + intra-element offset for anchored rendering.
+      // The descriptor identifies the clicked element so the heatmap
+      // viewer can paint the dot relative to wherever that element
+      // lands in the rebuilt snapshot. Clicks without a descriptor
+      // (non-element targets) are dropped by the rollup.
+      let descriptor: string | undefined;
+      let elementOffset: { x: number; y: number } | undefined;
+      try {
+        const desc = el ? buildStableDescriptor(el) : null;
+        if (desc) {
+          descriptor = serializeDescriptor(desc);
+          const rect = (el as HTMLElement).getBoundingClientRect();
+          if (rect.width > 0 && rect.height > 0) {
+            elementOffset = {
+              x: Math.round(((e.clientX - rect.left) / rect.width) * 100),
+              y: Math.round(((e.clientY - rect.top) / rect.height) * 100),
+            };
+          }
+        }
+      } catch {}
+
+      const clickData: Record<string, any> = {
+        // x/y/viewportX/viewportY are kept for diagnostics; the rollup
+        // ignores them and buckets clicks by descriptor + elementOffset.
         x: Math.round((e.clientX / window.innerWidth) * 10000) / 100,
         y: Math.round(((e.clientY + window.scrollY) / document.documentElement.scrollHeight) * 10000) / 100,
         documentHeight: document.documentElement.scrollHeight,
@@ -1901,6 +2471,10 @@ export class Recorder {
         elementHref: href,
         isInteractive: true,
       };
+      if (descriptor) {
+        clickData.descriptor = descriptor;
+        if (elementOffset) clickData.elementOffset = elementOffset;
+      }
 
       // If the element is clearly interactive, emit immediately
       if (isInteractive) {
@@ -1988,7 +2562,7 @@ export class Recorder {
    * Install fallback listeners on every `<video>` and `<audio>` to
    * recover click events that get absorbed by the user-agent shadow DOM
    * around native controls. Many browsers don't propagate clicks on the
-   * play/pause/scrubber buttons up to the document — so neither rrweb's
+   * play/pause/scrubber buttons up to the document, so neither rrweb's
    * MouseInteraction recorder nor our heatmap handler ever sees them.
    *
    * The play/pause events do fire reliably regardless of whether the
@@ -2027,7 +2601,7 @@ export class Recorder {
           });
           media.dispatchEvent(evt);
         } catch {
-          // ignore — best-effort recovery
+          // ignore; best-effort recovery
         }
       };
 
@@ -2096,19 +2670,43 @@ export class Recorder {
       if (now - this.lastInteractionTime > 5000) this.resetIdleTimer();
       if (now - this.lastMouseMoveEmit < 500) return;
       this.lastMouseMoveEmit = now;
-      this.emitCustomEvent('mouse_move', {
+
+      // Inner-scroll context: only attach when the moved-over element has
+      // at least one scrollable ancestor. Movement events are high-volume,
+      // and the bulk of moves happen over the page itself where the existing
+      // viewport-relative math is sufficient.
+      const target = e.target as HTMLElement | null;
+      const { scrollContext, containerOffset } = this.buildScrollContext(target, e.clientX, e.clientY);
+
+      const movePayload: Record<string, any> = {
         x: Math.round((e.clientX / window.innerWidth) * 10000) / 100,
         y: Math.round(((e.clientY + window.scrollY) / document.documentElement.scrollHeight) * 10000) / 100,
         documentHeight: document.documentElement.scrollHeight,
         page: stripUrlQuery(window.location.pathname),
-      });
+      };
+      if (scrollContext.length > 0) {
+        movePayload.scrollContext = scrollContext;
+        if (containerOffset) movePayload.containerOffset = containerOffset;
+      }
+      this.emitCustomEvent('mouse_move', movePayload);
     } catch (e2) {
       console.warn('SessionSight: error in mousemove handler', e2);
     }
   };
 
-  private handleHeatmapScroll = (): void => {
+  private handleHeatmapScroll = (e?: Event): void => {
     try {
+      // The window-level scroll listener is registered with `{capture: true}`,
+      // so scroll events from inner-element scrolling reach this handler too.
+      // When the target is an Element (not document/window), branch into the
+      // per-container path; page-scroll behavior continues unchanged when the
+      // event is on document or window.
+      const target = e?.target as Element | Document | Window | null;
+      if (target && target !== window && target !== document && (target as Element).nodeType === 1) {
+        this.handleContainerScroll(target as Element);
+        return;
+      }
+
       const now = Date.now();
       const scrollY = window.scrollY;
 
@@ -2206,17 +2804,15 @@ export class Recorder {
 
   // ── Error tracking ───────────────────────────────────────────────
 
-  private sanitizePii(str: string): string {
-    return str
-      // Strip email addresses
-      .replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '[email]')
-      // Strip phone numbers (various formats)
-      .replace(/(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}/g, '[phone]')
-      // Strip query strings AND fragments from URLs. Fragments matter for
-      // OAuth implicit flow (#access_token=...) and any client-side token
-      // routing pattern. Drop everything from ? or # onward; preserve the
-      // path so error logs still show *where* the failure happened.
-      .replace(/(https?:\/\/[^\s?#]+)[?#][^\s)"]*/g, '$1');
+  /**
+   * Strip PII and URL query/fragment from an error message or stack trace.
+   * Routes through redactString (full PII matrix: emails, phones, credit
+   * cards, SSNs, IBANs, JWTs, API keys) and additionally drops query/fragment
+   * from any embedded http(s) URLs so OAuth implicit-flow tokens
+   * (#access_token=...) and reset-link tokens never reach the server.
+   */
+  private sanitizeErrorText(str: string): string {
+    return redactString(str).replace(/(https?:\/\/[^\s?#]+)[?#][^\s)"]*/g, '$1');
   }
 
   private emitErrorEvent(data: {
@@ -2233,8 +2829,8 @@ export class Recorder {
     this.lastErrorTime = now;
 
     this.emitCustomEvent('error', {
-      message: this.sanitizePii(data.message),
-      stack: this.sanitizePii(data.stack),
+      message: this.sanitizeErrorText(data.message),
+      stack: this.sanitizeErrorText(data.stack),
       source: stripUrlQuery(data.source),
       lineno: data.lineno,
       colno: data.colno,
@@ -2300,7 +2896,7 @@ export class Recorder {
           this.idleSessionTimer = null;
           // Only terminate if still idle (no resetIdleTimer call cleared this).
           // Keep the bridge alive so the server can still push `rotate_session`
-          // when it seals the session — otherwise the seal signal has nowhere
+          // when it seals the session. Otherwise the seal signal has nowhere
           // to land and the SDK would be stuck on a stale sessionId.
           if (this.idleEmitted) {
             this.endedByIdle = true;

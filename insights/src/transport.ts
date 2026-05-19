@@ -334,18 +334,18 @@ export class Transport {
         return;
       }
 
-      // Sealed-session signal from HTTP response — tell the host to rotate.
+      // Sealed-session signal from HTTP response: tell the host to rotate.
       if (parsed && parsed.rotate === true && this.onRotateCallback) {
         this.onRotateCallback('http_sealed');
       }
 
-      // Freshly-minted visitor token on a first-sighting event — persist it
+      // Freshly-minted visitor token on a first-sighting event: persist it
       // so every subsequent request carries it.
       if (parsed && typeof parsed.rotateVisitorToken === 'string') {
         writeVisitorToken(parsed.rotateVisitorToken);
       }
     } catch {
-      // Silently fail — don't break the host page
+      // Silently fail; don't break the host page
     }
   }
 

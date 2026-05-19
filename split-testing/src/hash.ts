@@ -1,6 +1,12 @@
 /**
  * djb2 hash producing 0-9999 for fine-grained traffic allocation.
  * Same algorithm family as the flag-evaluation service.
+ *
+ * The `% 10000` modulo introduces a tiny bias because 2^32 isn't an exact
+ * multiple of 10000: ~7296 of the 4.29e9 hash values fall into the
+ * "extra" bucket band, so low-half buckets are favored by ~0.00017%.
+ * Negligible at any traffic volume that produces meaningful split-test
+ * results, and well below other sources of variance.
  */
 export function splitTestHash(seed: string, visitorId: string): number {
   const str = `${seed}:${visitorId}`;

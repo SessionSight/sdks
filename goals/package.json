@@ -60,8 +60,5 @@
   },
   "dependencies": {
     "@sessionsight/sdk-shared": "workspace:*"
-  },
-  "devDependencies": {
-    "@sessionsight/backend-shared": "workspace:*"
   }
 }

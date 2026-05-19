@@ -11,7 +11,7 @@ npm install @sessionsight/split-testing
 Or via script tag:
 
 ```html
-<script src="https://cdn.sessionsight.com/split-testing.js"></script>
+<script src="https://cdn.sessionsight.com/sessionsight-split-testing.js"></script>
 ```
 
 ## Documentation

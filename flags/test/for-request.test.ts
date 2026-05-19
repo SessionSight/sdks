@@ -78,7 +78,7 @@ describe('FeatureFlagClient.forRequest', () => {
     expect(ctx.userId).toBe('u');
   });
 
-  test('reads delegate to the underlying client', async () => {
+  test('bound reads come from the bound instance map populated on init', async () => {
     mockFetchResponse({
       flags: { 'dark-mode': { value: true, type: 'boolean' } },
     });
@@ -96,5 +96,34 @@ describe('FeatureFlagClient.forRequest', () => {
 
     expect(bound.getBooleanFlag('dark-mode', false)).toBe(true);
     expect(bound.isInitialized()).toBe(true);
+  });
+
+  test('two forRequest instances with different visitor cookies do NOT see each other\'s flag values', async () => {
+    const client = new FeatureFlagClient({
+      secretApiKey: 'sk',
+      environment: 'production',
+      propertyId: 'p',
+      apiUrl: 'http://x',
+    });
+
+    // Visitor A is in the rollout; server returns dark-mode=true.
+    mockFetchResponse({
+      flags: { 'dark-mode': { value: true, type: 'boolean' } },
+    });
+    const reqA = { cookies: { ss_vid: 'visitor-a', ss_sid: 'session-a' } };
+    const boundA = client.forRequest(reqA);
+    await boundA.init();
+
+    // Visitor B is NOT in the rollout; server returns dark-mode=false.
+    mockFetchResponse({
+      flags: { 'dark-mode': { value: false, type: 'boolean' } },
+    });
+    const reqB = { cookies: { ss_vid: 'visitor-b', ss_sid: 'session-b' } };
+    const boundB = client.forRequest(reqB);
+    await boundB.init();
+
+    // The invariant: A's bound view is unaffected by B's later evaluation.
+    expect(boundA.getBooleanFlag('dark-mode', false)).toBe(true);
+    expect(boundB.getBooleanFlag('dark-mode', true)).toBe(false);
   });
 });

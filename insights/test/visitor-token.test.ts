@@ -360,7 +360,7 @@ describe('writeVisitorId (sdk-shared)', () => {
 // kickBootstrap now passes clientVisitorId so the server can keep reusing
 // the cached id when it's still unclaimed. When the server refuses (stale
 // claim from a prior session), it mints a fresh UUID. The retry must then
-// send THAT id, not the original one — otherwise the freshly-minted token
+// send THAT id, not the original one. Otherwise the freshly-minted token
 // (bound to the new id) would fail verification against the old id.
 
 describe('Transport visitorId swap on REQUIRED retry', () => {
@@ -416,7 +416,7 @@ describe('Transport visitorId swap on REQUIRED retry', () => {
     expect(bootstrapBody?.clientVisitorId).toBe(OLD_ID);
     // Owner's local id was updated via the swap callback.
     expect(currentId).toBe(NEW_ID);
-    // Persisted too — future requests from any other code path use the
+    // Persisted too; future requests from any other code path use the
     // new id.
     expect(storage.get('sessionsight_visitor_id')).toBe(NEW_ID);
     expect(cookieBag.get('ss_vid')).toBe(NEW_ID);

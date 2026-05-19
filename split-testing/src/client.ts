@@ -1,7 +1,6 @@
 import type {
   SplitTestConfig,
   SplitTestConfigResponse,
-  SplitTestConfigEntry,
   Assignment,
   AssignedVariation,
   GetOptions,
@@ -15,17 +14,12 @@ import {
   setCachedAssignments,
   clearCache,
 } from './cache.js';
-import { readSessionCookie, extractIdsFromRequest } from '@sessionsight/sdk-shared';
-
-const FETCH_TIMEOUT_MS = 10_000;
-
-function fetchWithTimeout(url: string, options: RequestInit): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
-}
-
-import { normalizeApiUrl } from '@sessionsight/sdk-shared';
+import {
+  readSessionCookie,
+  extractIdsFromRequest,
+  normalizeApiUrl,
+  fetchWithTimeout,
+} from '@sessionsight/sdk-shared';
 
 const DEFAULT_STALE_TTL = 0;
 const DEFAULT_MAX_AGE = 86_400_000; // 24 hours
@@ -45,8 +39,13 @@ export class SplitTestingClient {
   private config: SplitTestConfigResponse | null = null;
   private assignments: Record<string, Assignment> = {};
   private initialized = false;
+  private aborted = false;
   private antiFlickerStyle: HTMLStyleElement | null = null;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
+  // Instance-lifetime dedup of exposures we've already queued/sent.
+  // Cleared on destroy(). The in-flight queue alone can't prevent
+  // duplicate POSTs because get() can fire again after a flush.
+  private exposedTestKeys: Set<string> = new Set();
   private pendingExposures: Array<{
     splitTestKey: string;
     variationKey: string;
@@ -95,10 +94,14 @@ export class SplitTestingClient {
         return;
       }
 
-      // Step 3: Try cached assignments
+      // Step 3: Hydrate previously-bucketed assignments. These are sticky:
+      // once a visitor sees a variation we keep them in that variation
+      // even if the test's hashSeed / weights / trafficAllocation later
+      // change, so we don't silently re-bucket exposed users mid-test
+      // (statistical-validity / SRM hole).
       const cachedAssignments = getCachedAssignments(this.propertyId, this.visitorId);
       if (cachedAssignments) {
-        this.assignments = cachedAssignments;
+        this.assignments = { ...cachedAssignments };
       }
 
       // Step 4: Check cached config
@@ -111,7 +114,8 @@ export class SplitTestingClient {
         if (age < this.maxAge) {
           this.config = cachedConfig.data;
 
-          // Re-evaluate assignments from cached config (to ensure consistency)
+          // Resolve assignments for any tests the visitor hasn't seen yet,
+          // preserving sticky entries from the cache for tests they have.
           this.evaluateAssignments();
           this.initialized = true;
 
@@ -200,9 +204,13 @@ export class SplitTestingClient {
     }
     this.flushExposures();
     this.removeAntiFlicker();
+    // Mark aborted so any in-flight background fetchConfig() stops short
+    // of writing onto a destroyed instance (HMR / SPA re-init race).
+    this.aborted = true;
     this.config = null;
     this.assignments = {};
     this.initialized = false;
+    this.exposedTestKeys.clear();
     this.pendingExposures = [];
   }
 
@@ -239,6 +247,27 @@ export class SplitTestingClient {
     if (!this.config) return;
 
     for (const test of this.config.tests) {
+      const cached = this.assignments[test.key];
+      if (cached) {
+        // Sticky: visitor was already bucketed for this test on a prior
+        // page / session. Even if hashSeed / weights / trafficAllocation
+        // changed since then, we keep the original assignment so an
+        // already-exposed visitor doesn't silently re-bucket. That
+        // would corrupt lift estimates and trip sample-ratio mismatch.
+        // We do refresh the variation `value` from the live config in
+        // case the operator edited the variation's content (the test
+        // identity is the variation key, not its value).
+        const variation = test.variations.find((v) => v.key === cached.variationKey);
+        if (variation) {
+          this.assignments[test.key] = {
+            ...cached,
+            value: variation.value,
+            type: test.type,
+          };
+        }
+        continue;
+      }
+
       const hash = splitTestHash(test.hashSeed, this.visitorId);
       const result = assignVariation(hash, test.trafficAllocation, test.variations);
       const variation = test.variations[result.variationIndex];
@@ -269,12 +298,17 @@ export class SplitTestingClient {
         headers: { 'x-api-key': this.publicApiKey },
       });
 
+      // The instance may have been destroyed while we were awaiting.
+      // Don't write onto a torn-down client (HMR / SPA re-init race).
+      if (this.aborted) return;
+
       if (!res.ok) {
         console.warn(`[SessionSight SplitTesting] Failed to fetch config: ${res.status}`);
         return;
       }
 
       const data = await res.json();
+      if (this.aborted) return;
       if (!data || !Array.isArray(data.tests)) {
         console.warn('[SessionSight SplitTesting] Invalid config response');
         return;
@@ -288,6 +322,7 @@ export class SplitTestingClient {
 
   private fetchConfigInBackground(): void {
     this.fetchConfig().then(() => {
+      if (this.aborted) return;
       if (this.config) {
         this.evaluateAssignments();
       }
@@ -295,8 +330,12 @@ export class SplitTestingClient {
   }
 
   private trackExposure(testKey: string, variationKey: string): void {
-    // Deduplicate: only track once per test per session
-    if (this.pendingExposures.some((e) => e.splitTestKey === testKey)) return;
+    // Instance-lifetime dedup: only one POST per (sessionId, testKey)
+    // per client instance. The pending-queue check alone wasn't enough
+    // because get() can fire again on later pageviews after a flush;
+    // the DB unique index would silently drop the dup, but we'd waste
+    // bandwidth/CPU and pressure the rate limiter.
+    if (this.exposedTestKeys.has(testKey)) return;
 
     // Pull sessionId from the ss_sid cookie. In the no-session state
     // (consent withdrawn / not yet granted) there is no session to key
@@ -305,6 +344,8 @@ export class SplitTestingClient {
     // record is only written when the user consented.
     const sessionId = readSessionCookie();
     if (!sessionId) return;
+
+    this.exposedTestKeys.add(testKey);
 
     this.pendingExposures.push({
       splitTestKey: testKey,
@@ -377,7 +418,7 @@ export class SplitTestingClient {
    * Bind this client to an inbound HTTP request (SSR / Node path). Returns
    * a wrapper whose exposure flushes use the request's `ss_sid` cookie.
    * Accepts Node-style, Fetch-style, pre-parsed cookie maps, or a raw
-   * cookie header string. In the browser this is unnecessary — ss_sid is
+   * cookie header string. In the browser this is unnecessary; ss_sid is
    * read fresh from `document.cookie` on each flush automatically.
    */
   forRequest(req: unknown): BoundSplitTestingClient {

@@ -54,15 +54,15 @@
     "verify-hint": "bun run scripts/verify-hint.ts",
     "prebuild": "bun run verify-hint",
     "prepublishOnly": "bun run verify-hint",
+    "pretest": "bun run build:worker",
     "build": "bun run build.ts",
     "build:worker": "bun run build.ts --worker-only",
     "dev:setup": "bun run build.ts --worker-only"
   },
   "dependencies": {
-    "rrweb": "^2.0.0-alpha.20"
+    "rrweb": "2.0.0-alpha.20"
   },
   "devDependencies": {
-    "@sessionsight/backend-shared": "workspace:*",
     "@sessionsight/sdk-shared": "workspace:*"
   },
   "peerDependencies": {

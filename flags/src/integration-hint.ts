@@ -1,5 +1,5 @@
 import FeatureFlags from './index.js';
-import type { IntegrationHint } from '@sessionsight/backend-shared/integration-hint-verifier';
+import type { IntegrationHint } from '@sessionsight/sdk-shared/integration-hint-verifier';
 
 /**
  * Server-side feature-flag SDK integration hint surfaced by the MCP server
@@ -15,7 +15,7 @@ export const integrationHint: IntegrationHint = {
     environment: 'production',
   }),
   usageFn: () => FeatureFlags.getBooleanFlag('YOUR_FLAG_KEY', false),
-  docsUrl: 'https://sessionsight.com/docs/flags',
+  docsUrl: 'https://sessionsight.com/docs/build/sdks/flags-sdk/setup',
 };
 
 export default integrationHint;

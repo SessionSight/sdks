@@ -66,7 +66,7 @@ beforeEach(() => {
     sendBeacon: (url: string, body: any) => {
       let parsed = body;
       if (body instanceof Blob) {
-        // Blob body — we can't read sync in jsdom-style but we got the url
+        // Blob body. We can't read sync in jsdom-style but we got the url
         parsed = body;
       }
       beaconCalls.push({ url, body: parsed });

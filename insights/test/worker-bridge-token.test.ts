@@ -7,7 +7,7 @@ import { test, expect, describe, beforeEach, afterEach, mock } from 'bun:test';
  * (rotate_visitor_token, visitor_token_rejected). The bridge owns
  * storage and bootstrap, and pushes the resulting state back to the
  * worker (set_visitor_token, set_visitor_id). These tests cover that
- * protocol end-to-end with a fake Worker — the actual worker.ts is
+ * protocol end-to-end with a fake Worker. The actual worker.ts is
  * covered separately in worker-token.test.ts.
  */
 
@@ -187,8 +187,8 @@ describe('WorkerBridge relays rotate_visitor_token', () => {
 //
 // This is the core recovery path: the worker couldn't send (401 or ws
 // 4004), the bridge re-bootstraps with the current visitorId, and when
-// the server refuses that id the bridge must swap everything — in-memory,
-// storage, and the worker — to the new server-issued id before pushing
+// the server refuses that id the bridge must swap everything (in-memory,
+// storage, and the worker) to the new server-issued id before pushing
 // the matching token.
 
 describe('WorkerBridge handles visitor_token_rejected', () => {
@@ -307,7 +307,7 @@ describe('WorkerBridge handles visitor_token_rejected', () => {
     fake.emit({ type: 'visitor_token_rejected', code: 'VISITOR_TOKEN_REQUIRED' });
     fake.emit({ type: 'visitor_token_rejected', code: 'VISITOR_TOKEN_REQUIRED' });
     fake.emit({ type: 'visitor_token_rejected', code: 'VISITOR_TOKEN_EXPIRED' });
-    // Settle — not long enough for bootstrap to resolve.
+    // Settle, but not long enough for bootstrap to resolve.
     await new Promise((r) => setTimeout(r, 5));
 
     expect(bootstrapCalls).toBe(1);
@@ -357,7 +357,7 @@ describe('WorkerBridge handles visitor_token_rejected', () => {
 // When Workers are unavailable, WorkerBridge falls back to main-thread
 // Transport. kickBootstrap in Transport needs access to the bridge's
 // visitorId state (via setVisitorIdBindings) to pass clientVisitorId on
-// bootstrap and propagate swaps — same shape as the worker path.
+// bootstrap and propagate swaps; same shape as the worker path.
 
 describe('WorkerBridge.initFallback wires Transport visitorId bindings', () => {
   test('fallback Transport receives get + onSwap callbacks', async () => {
@@ -401,6 +401,154 @@ describe('WorkerBridge.initFallback wires Transport visitorId bindings', () => {
     expect((bridge as any).visitorId).toBe(NEW_ID);
     // And persisted it.
     expect(storage.get('sessionsight_visitor_id')).toBe(NEW_ID);
+    bridge.destroy();
+  });
+});
+
+// ── onVisitorIdSwap fires on bootstrap recovery ─────────────────────
+//
+// recoverVisitorToken used to update only its private visitorId field;
+// callers like Recorder.visitorId and the module-level storedVisitorId in
+// index.ts kept stale ids forever, which broke getVisitorId() reads and
+// caused server-driven rotateSession() to construct a new bridge with
+// the wrong id (triggering another rejection loop).
+
+describe('WorkerBridge.onVisitorIdSwap', () => {
+  test('fires registered callbacks when bootstrap returns a different visitorId', async () => {
+    globalThis.fetch = (async (input: any) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url.includes('/v1/sdk/visitor/bootstrap')) {
+        return new Response(JSON.stringify({
+          visitorId: NEW_ID,
+          visitorToken: VALID_TOKEN,
+          issuedAt: Date.now(),
+        }), { status: 200 });
+      }
+      return new Response('{}', { status: 202 });
+    }) as any;
+
+    const fake = createFakeWorker();
+    mock.module('../src/worker-inline.js', () => ({ createInlineWorker: () => fake.worker }));
+
+    const { WorkerBridge } = await import('../src/worker-bridge.js');
+    const bridge = new WorkerBridge('http://localhost:3000', 'pub_key', 'prop-1', 'sess-1', OLD_ID);
+
+    const swapped: string[] = [];
+    bridge.onVisitorIdSwap((id) => swapped.push(id));
+    // Multiple subscribers (Recorder + index.ts) must all fire.
+    bridge.onVisitorIdSwap((id) => swapped.push(`b:${id}`));
+
+    fake.emit({ type: 'visitor_token_rejected', code: 'VISITOR_TOKEN_REQUIRED' });
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(swapped).toEqual([NEW_ID, `b:${NEW_ID}`]);
+    bridge.destroy();
+  });
+
+  test('does NOT fire callbacks when the server keeps the original id', async () => {
+    globalThis.fetch = (async (input: any) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url.includes('/v1/sdk/visitor/bootstrap')) {
+        return new Response(JSON.stringify({
+          visitorId: OLD_ID, // server reused it
+          visitorToken: VALID_TOKEN_2,
+          issuedAt: Date.now(),
+        }), { status: 200 });
+      }
+      return new Response('{}', { status: 202 });
+    }) as any;
+
+    const fake = createFakeWorker();
+    mock.module('../src/worker-inline.js', () => ({ createInlineWorker: () => fake.worker }));
+
+    const { WorkerBridge } = await import('../src/worker-bridge.js');
+    const bridge = new WorkerBridge('http://localhost:3000', 'pub_key', 'prop-1', 'sess-1', OLD_ID);
+
+    const swapped: string[] = [];
+    bridge.onVisitorIdSwap((id) => swapped.push(id));
+
+    fake.emit({ type: 'visitor_token_rejected', code: 'VISITOR_TOKEN_REQUIRED' });
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(swapped).toHaveLength(0);
+    bridge.destroy();
+  });
+
+  test('fires from the fallback Transport path too', async () => {
+    let bootstrapCalled = false;
+    globalThis.fetch = (async (input: any) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url.includes('/v1/sdk/visitor/bootstrap')) {
+        bootstrapCalled = true;
+        return new Response(JSON.stringify({
+          visitorId: NEW_ID,
+          visitorToken: VALID_TOKEN,
+          issuedAt: Date.now(),
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ error: 'x', code: 'VISITOR_TOKEN_REQUIRED' }), {
+        status: 401,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as any;
+
+    mock.module('../src/worker-inline.js', () => ({ createInlineWorker: () => null }));
+
+    const { WorkerBridge } = await import('../src/worker-bridge.js');
+    const bridge = new WorkerBridge('http://localhost:3000', 'pub_key', 'prop-1', 'sess-1', OLD_ID);
+
+    const swapped: string[] = [];
+    bridge.onVisitorIdSwap((id) => swapped.push(id));
+
+    const transport = (bridge as any).fallbackTransport;
+    await transport.sendHttpChunk({
+      sessionId: 'sess-1',
+      propertyId: 'prop-1',
+      visitorId: OLD_ID,
+      events: [{ type: 3, timestamp: 1 }],
+    });
+
+    expect(bootstrapCalled).toBe(true);
+    expect(swapped).toEqual([NEW_ID]);
+    bridge.destroy();
+  });
+});
+
+// ── M6: onKilled supports multiple subscribers ──────────────────────
+
+describe('WorkerBridge.onKilled (M6)', () => {
+  test('multiple registered callbacks all fire on killed', async () => {
+    const fake = createFakeWorker();
+    mock.module('../src/worker-inline.js', () => ({ createInlineWorker: () => fake.worker }));
+
+    const { WorkerBridge } = await import('../src/worker-bridge.js');
+    const bridge = new WorkerBridge('http://localhost:3000', 'pub_key', 'prop-1', 'sess-1', OLD_ID);
+
+    const fired: string[] = [];
+    bridge.onKilled(() => fired.push('a'));
+    bridge.onKilled(() => fired.push('b'));
+
+    fake.emit({ type: 'killed', reason: 'invalid_api_key' });
+
+    expect(fired).toEqual(['a', 'b']);
+    expect(bridge.isKilled()).toBe(true);
+    bridge.destroy();
+  });
+
+  test('a throwing subscriber does not block later subscribers', async () => {
+    const fake = createFakeWorker();
+    mock.module('../src/worker-inline.js', () => ({ createInlineWorker: () => fake.worker }));
+
+    const { WorkerBridge } = await import('../src/worker-bridge.js');
+    const bridge = new WorkerBridge('http://localhost:3000', 'pub_key', 'prop-1', 'sess-1', OLD_ID);
+
+    const fired: string[] = [];
+    bridge.onKilled(() => { throw new Error('first sub blew up'); });
+    bridge.onKilled(() => fired.push('b'));
+
+    fake.emit({ type: 'killed', reason: 'invalid_api_key' });
+
+    expect(fired).toEqual(['b']);
     bridge.destroy();
   });
 });

@@ -1,4 +1,5 @@
 import type { SplitTestConfigResponse, Assignment } from './types.js';
+import { hasLocalStorage } from '@sessionsight/sdk-shared';
 
 export { getOrCreateVisitorId } from '@sessionsight/sdk-shared';
 
@@ -10,23 +11,14 @@ interface CachedConfig {
   fetchedAt: number;
 }
 
-function hasLocalStorage(): boolean {
-  try {
-    const key = '__ss_test__';
-    localStorage.setItem(key, '1');
-    localStorage.removeItem(key);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-const canUseStorage = typeof window !== 'undefined' && hasLocalStorage();
+// `hasLocalStorage()` is invoked per call (not memoized at module load).
+// SSR-then-hydrate paths must re-evaluate, otherwise an SSR import would
+// permanently see `false` even after the browser bundle takes over.
 
 // ── Config Cache ────────────────────────────────────────────────────
 
 export function getCachedConfig(propertyId: string): CachedConfig | null {
-  if (!canUseStorage) return null;
+  if (typeof window === 'undefined' || !hasLocalStorage()) return null;
   try {
     const raw = localStorage.getItem(CONFIG_PREFIX + propertyId);
     if (!raw) return null;
@@ -37,7 +29,7 @@ export function getCachedConfig(propertyId: string): CachedConfig | null {
 }
 
 export function setCachedConfig(propertyId: string, data: SplitTestConfigResponse): void {
-  if (!canUseStorage) return;
+  if (typeof window === 'undefined' || !hasLocalStorage()) return;
   try {
     const cached: CachedConfig = { data, fetchedAt: Date.now() };
     localStorage.setItem(CONFIG_PREFIX + propertyId, JSON.stringify(cached));
@@ -49,7 +41,7 @@ export function setCachedConfig(propertyId: string, data: SplitTestConfigRespons
 // ── Assignment Cache ────────────────────────────────────────────────
 
 export function getCachedAssignments(propertyId: string, visitorId: string): Record<string, Assignment> | null {
-  if (!canUseStorage) return null;
+  if (typeof window === 'undefined' || !hasLocalStorage()) return null;
   try {
     const raw = localStorage.getItem(ASSIGNMENTS_PREFIX + propertyId + ':' + visitorId);
     if (!raw) return null;
@@ -64,7 +56,7 @@ export function setCachedAssignments(
   visitorId: string,
   assignments: Record<string, Assignment>,
 ): void {
-  if (!canUseStorage) return;
+  if (typeof window === 'undefined' || !hasLocalStorage()) return;
   try {
     localStorage.setItem(
       ASSIGNMENTS_PREFIX + propertyId + ':' + visitorId,
@@ -78,7 +70,7 @@ export function setCachedAssignments(
 // ── Cleanup ─────────────────────────────────────────────────────────
 
 export function clearCache(propertyId: string): void {
-  if (!canUseStorage) return;
+  if (typeof window === 'undefined' || !hasLocalStorage()) return;
   try {
     // Remove all keys with our prefix for this property
     const keysToRemove: string[] = [];

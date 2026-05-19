@@ -29,12 +29,18 @@ export class WorkerBridge {
   private lastAckedSeq = 0;
   private mirrorBuffer: Array<{ event: any; seq: number }> = [];
   private _killed = false;
+  // Tracks whether the worker has reported its WS as ready at least once and
+  // hasn't reported a closed/reconnect since. Used by sendBeacon() to decide
+  // whether the worker's flush-final will deliver (WS open) so we can skip
+  // the redundant navigator.sendBeacon and avoid duplicate ingest.
+  private workerWsReady = false;
 
   // Callbacks
   private onPrivacyCallback: ((config: PrivacyConfig) => void) | null = null;
-  private onKilledCallback: (() => void) | null = null;
+  private onKilledCallbacks: Array<() => void> = [];
   private onQuotaExceededCallback: (() => void) | null = null;
   private onRotateCallback: ((reason?: string) => void) | null = null;
+  private onVisitorIdSwapCallbacks: Array<(visitorId: string) => void> = [];
 
   // Session context (needed for sendBeacon payloads)
   private sessionId: string;
@@ -46,9 +52,15 @@ export class WorkerBridge {
   // Metadata and identify state (for sendBeacon payloads)
   private metadata: SessionMetadata | null = null;
   private metadataSent = false;
-  private stableId: string | null = null;
-  private userProperties: Record<string, string | number | boolean> | null = null;
-  private userPropertiesDirty = false;
+  // Cached identity slots. Dirty flag mirrors customPropertiesDirty:
+  // identity is shipped on every flush where it changed, then the flag
+  // clears so a steady-state identified visitor pays zero per-batch DB
+  // cost (paired with the alias service-side short-circuit).
+  private identifyId: string | null = null;
+  private identifyEmail: string | null = null;
+  private identityDirty = false;
+  private customProperties: Record<string, string | number | boolean> | null = null;
+  private customPropertiesDirty = false;
 
   // Fallback: inline transport + buffer when Workers unavailable
   private fallbackTransport: Transport | null = null;
@@ -122,14 +134,39 @@ export class WorkerBridge {
     }
   }
 
-  postIdentify(stableId: string, userProperties?: Record<string, string | number | boolean>): void {
-    this.stableId = stableId;
-    if (userProperties) {
-      this.userProperties = { ...(this.userProperties || {}), ...userProperties };
-      this.userPropertiesDirty = true;
+  /**
+   * Cache the parsed identify payload and forward it to the worker.
+   *
+   * `identityChanged` is set by the recorder when at least one of `id` /
+   * `email` was newly supplied (i.e. differs from the previously-cached
+   * value). It maps to the per-flush `identityDirty` flag so the worker
+   * skips writing `payload.id` / `payload.email` when nothing changed.
+   */
+  postIdentify(payload: {
+    id: string | null;
+    email: string | null;
+    customProperties?: Record<string, string | number | boolean>;
+    identityChanged: boolean;
+  }): void {
+    if (payload.identityChanged) {
+      this.identifyId = payload.id;
+      this.identifyEmail = payload.email;
+      this.identityDirty = true;
+    }
+    if (payload.customProperties && Object.keys(payload.customProperties).length > 0) {
+      this.customProperties = { ...(this.customProperties || {}), ...payload.customProperties };
+      this.customPropertiesDirty = true;
     }
     if (this.worker) {
-      try { this.worker.postMessage({ type: 'identify', stableId, userProperties }); } catch {}
+      try {
+        this.worker.postMessage({
+          type: 'identify',
+          id: this.identifyId,
+          email: this.identifyEmail,
+          customProperties: payload.customProperties,
+          identityChanged: payload.identityChanged,
+        });
+      } catch {}
     }
   }
 
@@ -143,14 +180,64 @@ export class WorkerBridge {
   }
 
   /**
-   * Page unload handler. Sends flush-final to worker AND fires sendBeacon
-   * with unacked events from the mirror buffer as a safety net.
+   * Flush and tear down with best-effort delivery, intended for the consent
+   * withdrawal / SPA-stop path. Sends `flush-final` to the worker (HTTP
+   * keepalive on its way out) before terminating it, so events on the wire
+   * still complete even though the worker is going away. The worker handles
+   * its own teardown on receipt of `flush-final`; we then terminate after
+   * a microtask to give the postMessage time to enqueue.
+   */
+  flushAndDestroy(): void {
+    if (this._killed) {
+      this.destroy();
+      return;
+    }
+    if (this.worker) {
+      try { this.worker.postMessage({ type: 'flush-final' }); } catch {}
+      // Yield once so the worker can pick up the message before terminate().
+      // The HTTP request inside the worker uses keepalive so the browser
+      // continues it after the worker exits. WS sends complete synchronously.
+      const w = this.worker;
+      this.worker = null;
+      queueMicrotask(() => {
+        try { w.terminate(); } catch {}
+      });
+    } else if (this.fallbackTransport) {
+      this.fallbackFlush();
+      this.fallbackTransport.destroy();
+      this.fallbackTransport = null;
+    }
+    if (this.fallbackFlushTimer) {
+      clearInterval(this.fallbackFlushTimer);
+      this.fallbackFlushTimer = null;
+    }
+    this.mirrorBuffer = [];
+    this.fallbackBuffer = [];
+  }
+
+  /**
+   * Page unload handler. When WS is open, the worker's flush-final will
+   * deliver via WS and we skip the redundant navigator.sendBeacon to avoid
+   * doubled events on the server (heatmap clicks, errors are not idempotent
+   * and the server has no per-event seq dedup).
+   *
+   * When WS is closed (or absent in fallback mode), fire sendBeacon as the
+   * sole delivery path; flush-final's HTTP fallback is best-effort and may
+   * be cancelled on page unload.
    */
   sendBeacon(): void {
-    // Tell the worker to flush and close
+    // Tell the worker to flush and close. If WS is open, this delivers via
+    // WS synchronously enough that the sendBeacon below would duplicate.
+    const wsWillDeliver = this.workerWsReady;
     if (this.worker) {
       try { this.worker.postMessage({ type: 'flush-final' }); } catch {}
     }
+
+    // Skip sendBeacon when the worker WS will carry the final flush. This is
+    // the common case (WS open at unload); sending both would duplicate the
+    // tail events at session end. If the worker post failed, we still fall
+    // through to sendBeacon below.
+    if (this.worker && wsWillDeliver) return;
 
     // Main-thread sendBeacon with unacked events
     const unacked = this.worker
@@ -170,9 +257,16 @@ export class WorkerBridge {
       final: true,
     };
 
-    if (this.stableId) payload.userId = this.stableId;
-    if (this.userPropertiesDirty && this.userProperties) {
-      payload.userProperties = { ...this.userProperties };
+    // Identity ships on every send-final payload regardless of dirty
+    // state. The keepalive path runs at unload time and has only one
+    // shot to write whatever identity the page knows. Unacked events
+    // bundled with this payload may not have reached the server yet,
+    // and they must carry identity. The backend's short-circuit findOne
+    // on the alias collection keeps this from being expensive.
+    if (this.identifyId) payload.id = this.identifyId;
+    if (this.identifyEmail) payload.email = this.identifyEmail;
+    if (this.customPropertiesDirty && this.customProperties) {
+      payload.customProperties = { ...this.customProperties };
     }
     if (!this.metadataSent && this.metadata) {
       payload.metadata = this.metadata;
@@ -206,8 +300,26 @@ export class WorkerBridge {
     }
   }
 
+  /**
+   * Register a handler that fires when the worker reports the session has been
+   * killed (invalid API key, subscription required). Multiple subscribers are
+   * supported so both Recorder (clears recorder state) and index.ts (clears
+   * module-level state) can react.
+   */
   onKilled(callback: () => void): void {
-    this.onKilledCallback = callback;
+    this.onKilledCallbacks.push(callback);
+  }
+
+  /**
+   * Register a handler that fires when the bootstrap recovery path swaps the
+   * visitorId (server refused to reuse the client's cached id). The bridge
+   * already updates its internal `this.visitorId` and persists the new id;
+   * subscribers update their own copies (Recorder.visitorId, the module-level
+   * storedVisitorId in index.ts) so getVisitorId() returns the swapped value
+   * and any subsequent rotateSession() carries the correct id forward.
+   */
+  onVisitorIdSwap(callback: (visitorId: string) => void): void {
+    this.onVisitorIdSwapCallbacks.push(callback);
   }
 
   onQuotaExceeded(callback: () => void): void {
@@ -232,6 +344,16 @@ export class WorkerBridge {
 
   isKilled(): boolean {
     return this._killed;
+  }
+
+  /**
+   * Re-arm a previously-killed bridge so the next event flow doesn't drop.
+   * The worker resets its own `killed` flag on `init`; bridges are normally
+   * constructed fresh per session so this rarely matters, but keep the
+   * symmetry available for tests and any future re-init flow.
+   */
+  resetKilled(): void {
+    this._killed = false;
   }
 
   destroy(): void {
@@ -271,11 +393,20 @@ export class WorkerBridge {
 
         case 'killed':
           this._killed = true;
-          if (this.onKilledCallback) this.onKilledCallback();
+          for (const cb of this.onKilledCallbacks) {
+            try { cb(); } catch (err) { console.warn('SessionSight: onKilled callback threw', err); }
+          }
           break;
 
         case 'ready':
           // WebSocket connected in worker
+          this.workerWsReady = true;
+          break;
+
+        case 'ws_closed':
+          // WebSocket dropped in worker; sendBeacon path should not assume
+          // flush-final will deliver until a new `ready` arrives.
+          this.workerWsReady = false;
           break;
 
         case 'quota_exceeded':
@@ -338,12 +469,18 @@ export class WorkerBridge {
         if (this.worker) {
           try { this.worker.postMessage({ type: 'set_visitor_id', visitorId: result.visitorId }); } catch {}
         }
+        // Propagate the new id up the stack: Recorder.visitorId and the
+        // module-level storedVisitorId in index.ts must match so a future
+        // server-driven rotateSession() carries the correct id forward.
+        for (const cb of this.onVisitorIdSwapCallbacks) {
+          try { cb(result.visitorId); } catch (err) { console.warn('SessionSight: onVisitorIdSwap callback threw', err); }
+        }
       }
       if (this.worker) {
         try { this.worker.postMessage({ type: 'set_visitor_token', visitorToken: result.visitorToken }); } catch {}
       }
     } catch {
-      // Bootstrap failed — the next event will trigger another rejection
+      // Bootstrap failed; the next event will trigger another rejection
       // and we'll try again. No point killing the recorder.
     }
   }
@@ -354,7 +491,14 @@ export class WorkerBridge {
     this.fallbackTransport = new Transport(this.apiUrl, this.publicApiKey, this.propertyId);
     this.fallbackTransport.setVisitorIdBindings(
       () => this.visitorId,
-      (id) => { this.visitorId = id; },
+      (id) => {
+        this.visitorId = id;
+        // Mirror the worker-path swap so subscribers (Recorder, index.ts)
+        // see the new id regardless of which transport recovered the token.
+        for (const cb of this.onVisitorIdSwapCallbacks) {
+          try { cb(id); } catch (err) { console.warn('SessionSight: onVisitorIdSwap callback threw', err); }
+        }
+      },
     );
     if (this.onPrivacyCallback) {
       this.fallbackTransport.onPrivacy(this.onPrivacyCallback);
@@ -391,7 +535,9 @@ export class WorkerBridge {
       this._killed = true;
       this.fallbackBuffer = [];
       if (this.fallbackFlushTimer) { clearInterval(this.fallbackFlushTimer); this.fallbackFlushTimer = null; }
-      if (this.onKilledCallback) this.onKilledCallback();
+      for (const cb of this.onKilledCallbacks) {
+        try { cb(); } catch (err) { console.warn('SessionSight: onKilled callback threw', err); }
+      }
       return;
     }
 
@@ -403,10 +549,14 @@ export class WorkerBridge {
       events,
     };
 
-    if (this.stableId) payload.userId = this.stableId;
-    if (this.userPropertiesDirty && this.userProperties) {
-      payload.userProperties = { ...this.userProperties };
-      this.userPropertiesDirty = false;
+    if (this.identityDirty) {
+      if (this.identifyId) payload.id = this.identifyId;
+      if (this.identifyEmail) payload.email = this.identifyEmail;
+      this.identityDirty = false;
+    }
+    if (this.customPropertiesDirty && this.customProperties) {
+      payload.customProperties = { ...this.customProperties };
+      this.customPropertiesDirty = false;
     }
     if (!this.metadataSent && this.metadata) {
       payload.metadata = this.metadata;

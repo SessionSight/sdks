@@ -3,7 +3,7 @@ import { applyMasking, isPasswordElement, maskEventPlaceholders, rotateScrambleC
 
 // Minimal HTMLElement stub. The masking helpers only use:
 //   tagName, type (for inputs), hasAttribute(), closest()
-// — so we shim those instead of pulling in a full DOM library.
+// We shim those instead of pulling in a full DOM library.
 function el(opts: {
   tagName?: string;
   type?: string;
@@ -80,6 +80,73 @@ describe('applyMasking - password floor', () => {
     // Both produce the same fixed [REDACTED] token, so password length cannot be inferred from the captured value.
     expect(short).toBe('[REDACTED]');
     expect(long).toBe('[REDACTED]');
+  });
+});
+
+describe('rotateScrambleCipher - secure RNG enforcement', () => {
+  test('throws when crypto.getRandomValues is unavailable (no Math.random fallback)', () => {
+    // secureRandomInt used to fall back to Math.random when crypto was
+    // missing, contradicting transport.ts / worker.ts comments that say
+    // Math.random is banned across the package.
+    // The scramble cipher's reversibility relies on a CSPRNG, so we'd
+    // rather throw than degrade silently.
+    const origCrypto = (globalThis as any).crypto;
+    try {
+      // Strip getRandomValues from crypto so the secureRandomInt branch
+      // takes the throw path.
+      (globalThis as any).crypto = { randomUUID: () => 'x' };
+      expect(() => rotateScrambleCipher()).toThrow(/getRandomValues unavailable/);
+    } finally {
+      (globalThis as any).crypto = origCrypto;
+      // Restore a working cipher for any subsequent tests in the suite.
+      rotateScrambleCipher();
+    }
+  });
+});
+
+describe('applyMasking - relaxed mode form input scrambling', () => {
+  test('relaxed mode scrambles input values regardless of privacy mode', () => {
+    // Relaxed mode used to return form input values unchanged, contradicting
+    // sdk-privacy.md ("Form input values are not captured"). Passing
+    // kind='input' must scramble the value in both privacy modes.
+    const input = el({ tagName: 'INPUT', type: 'text' });
+    const value = 'sensitive search query';
+    const scrambledRelaxed = applyMasking(value, input, 'relaxed', 'input');
+    const scrambledDefault = applyMasking(value, input, 'default', 'input');
+    expect(scrambledRelaxed).not.toBe(value);
+    expect(scrambledDefault).not.toBe(value);
+    expect(scrambledRelaxed.length).toBe(value.length);
+  });
+
+  test('relaxed mode scrambles input values even with data-ss-unmask ancestor', () => {
+    // unmask must NOT opt input values out of scramble. PII detection is
+    // best-effort and a free-text field is exactly the kind of value
+    // relaxed mode is supposed to hide.
+    const ancestor = { hasAttribute: (n: string) => n === 'data-ss-unmask' };
+    const input = el({
+      tagName: 'INPUT',
+      type: 'text',
+      closest: (sel: string) => (sel.includes('data-ss-') ? ancestor : null),
+    });
+    // Pick a value with no PII patterns so length comparison stays clean.
+    const value = 'a free text answer';
+    const out = applyMasking(value, input, 'relaxed', 'input');
+    expect(out).not.toBe(value);
+    expect(out.length).toBe(value.length);
+  });
+
+  test('password floor still wins over input scramble', () => {
+    const password = el({ tagName: 'INPUT', type: 'password' });
+    expect(applyMasking('hunter2', password, 'relaxed', 'input')).toBe('[REDACTED]');
+    expect(applyMasking('hunter2', password, 'default', 'input')).toBe('[REDACTED]');
+  });
+
+  test('default mode (kind=text) still passes through unchanged in relaxed mode without unmask', () => {
+    // Sanity check: text-node masking in relaxed mode without a directive
+    // still returns the redacted-but-readable string.
+    const elem = el({ tagName: 'P' });
+    const value = 'Welcome back';
+    expect(applyMasking(value, elem, 'relaxed')).toBe(value);
   });
 });
 

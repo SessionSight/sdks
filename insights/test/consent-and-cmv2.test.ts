@@ -131,10 +131,12 @@ mock.module('../src/worker-bridge.js', () => ({
     onQuotaExceeded(cb: Function) { this.onQuotaCb = cb; }
     onRotate(cb: Function) { this.onRotateCb = cb; }
     onKilled(_cb: Function) {}
+    onVisitorIdSwap(_cb: Function) {}
     postEvent() {}
     postMetadata() {}
     postIdentify() {}
     flush() {}
+    flushAndDestroy() { this.destroyed = true; }
     destroy() { this.destroyed = true; }
   },
 }));
@@ -248,8 +250,8 @@ describe('setConsent state transitions', () => {
     SessionSight.setConsent(false);
 
     // Should not throw; identify silently no-ops because there's no
-    // current recorder to write the userId onto.
-    expect(() => SessionSight.identify('user-123')).not.toThrow();
+    // current recorder to write the identity onto.
+    expect(() => SessionSight.identify({ id: 'user-123' })).not.toThrow();
   });
 
   test('getVisitorId returns null in no-session state', async () => {
@@ -416,7 +418,7 @@ describe('honorConsentMode opt-in (CMv2)', () => {
     SessionSight.init({ ...BASE_CONFIG, honorConsentMode: true });
     const bridgesAfterInit = bridgeInstances.length;
 
-    // Updates to ad_storage, functionality_storage, etc. — no analytics_storage key.
+    // Updates to ad_storage, functionality_storage, etc., with no analytics_storage key.
     (globalThis as any).window.gtag('consent', 'update', { ad_storage: 'denied' });
     (globalThis as any).window.gtag('consent', 'update', { functionality_storage: 'granted' });
 

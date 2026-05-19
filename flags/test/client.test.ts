@@ -148,6 +148,85 @@ describe('FeatureFlagClient', () => {
     expect(client.getBooleanFlag('f', false)).toBe(false);
   });
 
+  test('destroy also wipes the secret api key from the instance', async () => {
+    mockFetchResponse({ flags: {} });
+
+    const client = new FeatureFlagClient({
+      secretApiKey: 'super-secret',
+      environment: 'prod',
+      propertyId: 'test-prop',
+      apiUrl: 'http://localhost:3001',
+    });
+    await client.init();
+    client.destroy();
+
+    // After destroy the next refresh fires a fetch with no credentials.
+    // We observe via the headers on the outgoing request.
+    mockFetchResponse({ flags: {} });
+    await client.refresh();
+    const [, opts] = mockFetch.mock.calls[mockFetch.mock.calls.length - 1] as any[];
+    expect(opts.headers['x-api-key']).toBe('');
+  });
+
+  test('logs response body excerpt on non-2xx', async () => {
+    mockFetch.mockResolvedValue(
+      new Response('Environment "staging" not found', { status: 404 }),
+    );
+
+    const warns: string[] = [];
+    const logger = { warn: (msg: string) => warns.push(msg) };
+
+    const client = new FeatureFlagClient({
+      secretApiKey: 'k',
+      environment: 'staging',
+      propertyId: 'p',
+      apiUrl: 'http://localhost:3001',
+      logger,
+    });
+    await client.init();
+
+    expect(warns.length).toBeGreaterThan(0);
+    expect(warns.some((m) => m.includes('HTTP 404') && m.includes('Environment'))).toBe(true);
+  });
+
+  test('honors custom timeoutMs and surfaces aborted fetch as timeout', async () => {
+    // Make fetch reject with AbortError (mimics what AbortController does).
+    mockFetch.mockImplementation(() => Promise.reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+
+    const warns: string[] = [];
+    const logger = { warn: (msg: string) => warns.push(msg) };
+
+    const client = new FeatureFlagClient({
+      secretApiKey: 'k',
+      environment: 'prod',
+      propertyId: 'p',
+      apiUrl: 'http://localhost:3001',
+      timeoutMs: 25,
+      logger,
+    });
+    await client.init();
+
+    expect(warns.some((m) => m.includes('timed out after 25ms'))).toBe(true);
+  });
+
+  test('uses configured logger instead of console for warnings', async () => {
+    mockFetch.mockRejectedValue(new Error('network error'));
+
+    const warns: unknown[][] = [];
+    const logger = { warn: (...args: unknown[]) => warns.push(args) };
+
+    const client = new FeatureFlagClient({
+      secretApiKey: 'k',
+      environment: 'prod',
+      propertyId: 'p',
+      apiUrl: 'http://localhost:3001',
+      logger,
+    });
+    await client.init();
+
+    expect(warns.length).toBeGreaterThan(0);
+  });
+
   test('handles fetch failure gracefully', async () => {
     mockFetch.mockRejectedValue(new Error('network error'));
 

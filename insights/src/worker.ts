@@ -14,8 +14,11 @@ interface IngestPayload {
   visitorId: string;
   events: any[];
   metadata?: SessionMetadata;
-  userId?: string | null;
-  userProperties?: Record<string, string | number | boolean>;
+  // Customer-supplied identity slots. The SDK's `identify({id?, email?})`
+  // routes here. Backend maps `id` -> DB column `userId`.
+  id?: string | null;
+  email?: string | null;
+  customProperties?: Record<string, string | number | boolean>;
   seqStart?: number;
   seqEnd?: number;
   final?: boolean;
@@ -62,9 +65,11 @@ let propertyId = '';
 let sessionId = '';
 let visitorId = '';
 let visitorToken: string | null = null;
-let stableId: string | null = null;
-let userProperties: Record<string, string | number | boolean> | null = null;
-let userPropertiesDirty = false;
+let identifyId: string | null = null;
+let identifyEmail: string | null = null;
+let identityDirty = false;
+let customProperties: Record<string, string | number | boolean> | null = null;
+let customPropertiesDirty = false;
 let metadata: SessionMetadata | null = null;
 let metadataSent = false;
 let killed = false;
@@ -129,6 +134,10 @@ function connectWs(): void {
           if (msg.privacy) {
             self.postMessage({ type: 'privacy', config: msg.privacy });
           }
+          // Drain any events buffered while WS was reconnecting (e.g. after
+          // set_visitor_token). The previous behavior eagerly flushed on
+          // set_visitor_token and always hit HTTP because wsReady was false.
+          if (buffer.length > 0) flush();
         }
         if (msg.type === 'quota_exceeded') {
           self.postMessage({ type: 'quota_exceeded' });
@@ -148,6 +157,14 @@ function connectWs(): void {
     ws.onclose = (event) => {
       wsReady = false;
       ws = null;
+      // Notify the bridge that the WS dropped so unload-path delivery can
+      // pick the right transport (sendBeacon when WS is closed, flush-final
+      // when WS is open). Only emit for non-terminal closes; the 4001/4002
+      // killed cases tear down anyway, and 4004 is handled below as a
+      // distinct visitor_token_rejected signal.
+      if (event.code !== 4001 && event.code !== 4002 && event.code !== 4004) {
+        self.postMessage({ type: 'ws_closed' });
+      }
 
       if (event.code === 4001) {
         killed = true;
@@ -169,6 +186,9 @@ function connectWs(): void {
         flushWsInFlightOnReject();
         const reason = typeof event.reason === 'string' ? event.reason : 'visitor_token_required';
         self.postMessage({ type: 'visitor_token_rejected', code: reason });
+        // Bridge needs to know the WS isn't going to deliver flush-final
+        // until the new token arrives.
+        self.postMessage({ type: 'ws_closed' });
         scheduleReconnect();
         return;
       }
@@ -212,11 +232,20 @@ function flush(isFinal: boolean = false): void {
     seqEnd,
   };
 
-  if (stableId) payload.userId = stableId;
+  // Identity flag-gated: ship `id` / `email` only when they changed
+  // since the last successful flush. The backend's alias short-circuit
+  // (findOne by exact triple) keeps steady-state cost flat even if the
+  // SDK ever ends up over-shipping, but skipping the wire entirely
+  // matches the customPropertiesDirty pattern and shaves payload bytes.
+  if (identityDirty) {
+    if (identifyId) payload.id = identifyId;
+    if (identifyEmail) payload.email = identifyEmail;
+    identityDirty = false;
+  }
 
-  if (userPropertiesDirty && userProperties) {
-    payload.userProperties = { ...userProperties };
-    userPropertiesDirty = false;
+  if (customPropertiesDirty && customProperties) {
+    payload.customProperties = { ...customProperties };
+    customPropertiesDirty = false;
   }
 
   if (!metadataSent && metadata) {
@@ -233,8 +262,8 @@ function flush(isFinal: boolean = false): void {
 
 // Restore entries to the front of the buffer after a recoverable failure
 // (e.g. visitor token rejection). Keeps original seq order so acks pair up
-// once the main thread's mirror advances. Metadata / userProperties /
-// identify state set on the failed payload stay committed — they're
+// once the main thread's mirror advances. Metadata / customProperties /
+// identify state set on the failed payload stay committed; they're
 // lightweight and idempotent; re-sending them on the next flush is fine.
 function requeueEntries(entries: Array<{ event: any; seq: number }>): void {
   if (entries.length === 0) return;
@@ -276,11 +305,12 @@ async function sendHttpAsync(
   entries: Array<{ event: any; seq: number }>,
 ): Promise<void> {
   const chunks = chunkEvents(payload);
+  const isFinal = payload.final === true;
   let anyFailed = false;
   // Entries from token-rejected chunks: requeue at the end so they get
   // re-sent after the main thread delivers a fresh token via
   // `set_visitor_token`. Entries from non-token failures (network errors)
-  // aren't requeued — the mirror buffer on the main thread already holds
+  // aren't requeued. The mirror buffer on the main thread already holds
   // them for sendBeacon on page unload, and requeueing could double-send
   // if the network error hid a successful server write.
   const rejectedEntries: Array<{ event: any; seq: number }> = [];
@@ -291,6 +321,16 @@ async function sendHttpAsync(
     try {
       const withToken: any = visitorToken ? { ...chunk, visitorToken } : chunk;
       const body = JSON.stringify(withToken);
+      // keepalive is capped at ~64KB by Chrome/Firefox. If a single event
+      // exceeds that (oversized FullSnapshot is the typical culprit) we'd
+      // fail the keepalive precondition; on a normal page lifecycle the
+      // request still completes. On unload (final=true), keepalive is the
+      // only delivery guarantee, but a >64KB body would be rejected with
+      // keepalive set, so we drop the flag and accept best-effort delivery
+      // rather than a guaranteed cancellation. This trades certainty for
+      // a chance: better than always losing the FullSnapshot for early
+      // bouncers on heavy pages.
+      const useKeepalive = body.length < MAX_KEEPALIVE_BYTES;
       const res = await fetch(`${apiUrl}/v1/ingest`, {
         method: 'POST',
         headers: {
@@ -298,7 +338,7 @@ async function sendHttpAsync(
           'x-api-key': publicApiKey,
         },
         body,
-        keepalive: body.length < MAX_KEEPALIVE_BYTES,
+        keepalive: useKeepalive,
       });
       if (res.status === 429) {
         self.postMessage({ type: 'quota_exceeded' });
@@ -403,9 +443,11 @@ self.onmessage = (e: MessageEvent) => {
         sessionId = msg.sessionId;
         visitorId = msg.visitorId;
         visitorToken = typeof msg.visitorToken === 'string' ? msg.visitorToken : null;
-        stableId = null;
-        userProperties = null;
-        userPropertiesDirty = false;
+        identifyId = null;
+        identifyEmail = null;
+        identityDirty = false;
+        customProperties = null;
+        customPropertiesDirty = false;
         metadata = null;
         metadataSent = false;
         killed = false;
@@ -423,12 +465,22 @@ self.onmessage = (e: MessageEvent) => {
       case 'set_visitor_token':
         // Main thread has a fresh token (from bootstrap or inline-mint in
         // the HTTP fallback path). Reconnect WS so the handshake carries
-        // the new token, then flush any buffered events.
+        // the new token. The previous behavior fired flush() synchronously
+        // here, but connectWs() is async; the synchronous flush always fell
+        // through to HTTP because wsReady was still false. Now we either
+        // drain through the WS `ready` handler (preferred) or schedule a
+        // short-deadline HTTP fallback for the case where WS never comes
+        // up (network failure, blocked handshake) so events don't sit in
+        // the buffer until the next 6s flushTimer tick.
         if (typeof msg.visitorToken === 'string') {
           visitorToken = msg.visitorToken;
           if (ws) { try { ws.close(1000); } catch {} ws = null; wsReady = false; }
           connectWs();
-          if (buffer.length > 0) flush();
+          if (buffer.length > 0) {
+            setTimeout(() => {
+              if (!killed && !wsReady && buffer.length > 0) flush();
+            }, 100);
+          }
         }
         break;
 
@@ -453,10 +505,14 @@ self.onmessage = (e: MessageEvent) => {
         break;
 
       case 'identify':
-        stableId = msg.stableId;
-        if (msg.userProperties) {
-          userProperties = { ...(userProperties || {}), ...msg.userProperties };
-          userPropertiesDirty = true;
+        if (msg.identityChanged) {
+          identifyId = msg.id ?? null;
+          identifyEmail = msg.email ?? null;
+          identityDirty = true;
+        }
+        if (msg.customProperties && Object.keys(msg.customProperties).length > 0) {
+          customProperties = { ...(customProperties || {}), ...msg.customProperties };
+          customPropertiesDirty = true;
         }
         break;
 

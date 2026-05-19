@@ -10,7 +10,7 @@ import { test, expect, describe, beforeEach, afterEach, mock } from 'bun:test';
  *   2. Mint a fresh sessionId (preserving visitorId for consent continuity).
  *   3. Write the new sessionId to the `ss_sid` cookie so backend SDKs pair.
  *   4. Create a new WorkerBridge on the new sessionId.
- *   5. NOT start a recorder — arm activity-based resurrection instead. The
+ *   5. NOT start a recorder. Arm activity-based resurrection instead. The
  *      server only seals after the user has been idle, so there is nobody
  *      on the page to record yet.
  *   6. Respect consent (`enabledGetter` returning false) and stay paused.
@@ -87,6 +87,9 @@ beforeEach(() => {
   let counter = 0;
   (globalThis as any).crypto = {
     randomUUID: () => `uuid-${++counter}`,
+    getRandomValues: (origCrypto && typeof origCrypto.getRandomValues === 'function')
+      ? (buf: any) => origCrypto.getRandomValues(buf)
+      : (buf: any) => { for (let i = 0; i < buf.length; i++) buf[i] = (i * 7 + 1) >>> 0; return buf; },
   };
 });
 
@@ -107,6 +110,8 @@ interface BridgeStub {
   onRotate: ((reason?: string) => void) | null;
   onPrivacy: ((c: any) => void) | null;
   onQuotaExceeded: (() => void) | null;
+  onVisitorIdSwapCbs: Array<(id: string) => void>;
+  onKilledCbs: Array<() => void>;
 }
 
 const bridges: BridgeStub[] = [];
@@ -127,6 +132,8 @@ mock.module('../src/worker-bridge.js', () => ({
         onRotate: null,
         onPrivacy: null,
         onQuotaExceeded: null,
+        onVisitorIdSwapCbs: [],
+        onKilledCbs: [],
       };
       bridges.push(stub);
       // Store reference so the wrapper can hit these when the SDK calls them.
@@ -135,10 +142,13 @@ mock.module('../src/worker-bridge.js', () => ({
     onPrivacy(cb: any) { (this as any)._stub.onPrivacy = cb; }
     onQuotaExceeded(cb: any) { (this as any)._stub.onQuotaExceeded = cb; }
     onRotate(cb: any) { (this as any)._stub.onRotate = cb; }
+    onKilled(cb: any) { (this as any)._stub.onKilledCbs.push(cb); }
+    onVisitorIdSwap(cb: any) { (this as any)._stub.onVisitorIdSwapCbs.push(cb); }
     postEvent() {}
     postMetadata() {}
     postIdentify() {}
     flush() {}
+    flushAndDestroy() { (this as any)._stub.destroyed = true; }
     sendBeacon() {}
     destroy() { (this as any)._stub.destroyed = true; }
     isKilled() { return false; }
@@ -158,7 +168,9 @@ const recorders: RecorderStub[] = [];
 
 mock.module('../src/recorder.js', () => ({
   Recorder: class {
-    constructor(bridge: any, _prop: any, _vis: any, _cfg: any) {
+    private vid: string;
+    constructor(bridge: any, _prop: any, vis: any, _cfg: any) {
+      this.vid = vis;
       const stub: RecorderStub = {
         id: recorders.length,
         started: false,
@@ -167,6 +179,11 @@ mock.module('../src/recorder.js', () => ({
       };
       recorders.push(stub);
       (this as any)._stub = stub;
+      // Mirror the real Recorder: subscribe to bridge.onVisitorIdSwap so
+      // getVisitorId reflects bootstrap-recovery swaps.
+      if (typeof bridge?.onVisitorIdSwap === 'function') {
+        bridge.onVisitorIdSwap((newId: string) => { this.vid = newId; });
+      }
     }
     start() { (this as any)._stub.started = true; }
     // Match the real Recorder: stop() with default args destroys the bridge.
@@ -180,7 +197,7 @@ mock.module('../src/recorder.js', () => ({
     }
     beginRecording() {}
     identify() {}
-    getVisitorId() { return null; }
+    getVisitorId() { return this.vid; }
     getBridge() { return (this as any)._stub.bridgeRef; }
     getPropertyId() { return 'prop-1'; }
     applyPrivacyConfig() {}
@@ -269,23 +286,48 @@ describe('rotateSession()', () => {
     triggerRotate();
     const visitorAfter = SessionSight.getVisitorId();
 
-    // getVisitorId is sourced from the current recorder — after rotation no
-    // recorder is attached yet, so it returns null. The more meaningful check
-    // is that the same visitorId flows into the new WorkerBridge. We assert
-    // that by observing the bridge constructor argument indirectly: calling
-    // goals.increment() (which uses storedVisitorId) should still work.
-    expect(visitorBefore).toBeNull(); // mock recorder always returns null
-    expect(visitorAfter).toBeNull();
-
-    // Real check: the new bridge must have been constructed with the SAME
-    // visitorId the original init generated. We can't read it off the stub
-    // directly, but we know rotateSession uses `storedVisitorId`, and that
-    // module-level variable is never reassigned after init — so if the
-    // rotation didn't throw, the visitor is preserved.
+    // After H1: getVisitorId falls through to storedVisitorId when no recorder
+    // is attached (e.g., between rotateSession() and the resurrection that
+    // attaches the new recorder). So both reads return the same persisted
+    // visitorId, and the new bridge was constructed with it.
+    expect(visitorBefore).not.toBeNull();
+    expect(visitorAfter).toBe(visitorBefore);
     expect(bridges).toHaveLength(2);
   });
 
-  test('does NOT start a recorder on rotate — arms resurrection instead', async () => {
+  test('bridge.onVisitorIdSwap propagates to getVisitorId() and the next rotation', async () => {
+    // When the bridge's bootstrap recovery path swaps the visitorId,
+    // the change must reach:
+    //   1. The Recorder (so getVisitorId() reflects it)
+    //   2. The module-level storedVisitorId (so the next rotateSession()
+    //      builds the new bridge with the swapped id, not the stale one)
+    const SessionSight = await freshSessionSight();
+    SessionSight.init({ publicApiKey: 'pk_test', propertyId: 'prop-1', apiUrl: 'https://api.example.com' });
+
+    const before = SessionSight.getVisitorId();
+    expect(before).toBe('uuid-1');
+
+    // Simulate the bridge's recoverVisitorToken firing the swap callback.
+    // The Recorder and index.ts each subscribe; we fire all of them.
+    const swapCbs = bridges[0]!.onVisitorIdSwapCbs;
+    expect(swapCbs.length).toBeGreaterThanOrEqual(2);
+    for (const cb of swapCbs) cb('swapped-vid-9999');
+
+    // getVisitorId now reflects the new id (Recorder.visitorId was updated).
+    expect(SessionSight.getVisitorId()).toBe('swapped-vid-9999');
+
+    // Rotate. The new bridge must be constructed with the swapped id, not
+    // uuid-1 (which was the original storedVisitorId). The 5th constructor
+    // arg is visitorId; we read it indirectly via the post-rotation read.
+    triggerRotate();
+    expect(bridges).toHaveLength(2);
+    // After rotation, no recorder is attached yet (rotate arms resurrection
+    // instead). getVisitorId falls through to storedVisitorId, which the
+    // bridge.onVisitorIdSwap also updated.
+    expect(SessionSight.getVisitorId()).toBe('swapped-vid-9999');
+  });
+
+  test('does NOT start a recorder on rotate; arms resurrection instead', async () => {
     const SessionSight = await freshSessionSight();
     SessionSight.init({ publicApiKey: 'pk_test', propertyId: 'prop-1', apiUrl: 'https://api.example.com' });
 
@@ -330,7 +372,7 @@ describe('rotateSession()', () => {
       consent: () => consentGranted,
     });
 
-    // Withdraw consent — under the session-as-identity model this detaches
+    // Withdraw consent. Under the session-as-identity model this detaches
     // the SDK from the current session entirely. There's no session to rotate.
     consentGranted = false;
     SessionSight.setConsent(false);

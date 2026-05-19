@@ -1,12 +1,24 @@
-import type { FeatureFlagConfig, FlagEvaluationContext, EvaluatedFlags, FlagListResult } from './types.js';
-import { normalizeApiUrl, setRegistryValue, extractIdsFromRequest } from '@sessionsight/sdk-shared';
+import type { FeatureFlagConfig, FlagEvaluationContext, EvaluatedFlags, FlagListResult, FlagLogger } from './types.js';
+import {
+  normalizeApiUrl,
+  setRegistryValue,
+  extractIdsFromRequest,
+  fetchWithTimeout,
+  FETCH_TIMEOUT_MS,
+} from '@sessionsight/sdk-shared';
 
-const FETCH_TIMEOUT_MS = 10_000;
-
-function fetchWithTimeout(url: string, options: RequestInit): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
+/**
+ * Truncate a response body for logging. We don't want to dump 5MB of HTML
+ * into a user's logger if the upstream returned an error page.
+ */
+async function readBodyExcerpt(res: Response, max = 500): Promise<string> {
+  try {
+    const text = await res.text();
+    if (text.length <= max) return text;
+    return `${text.slice(0, max)}... (truncated)`;
+  } catch {
+    return '<unreadable body>';
+  }
 }
 
 export class FeatureFlagClient {
@@ -17,8 +29,16 @@ export class FeatureFlagClient {
   private flags: EvaluatedFlags = {};
   private context: FlagEvaluationContext = {};
   private initialized = false;
+  private timeoutMs: number;
+  private logger: FlagLogger;
 
   constructor(config: FeatureFlagConfig) {
+    // Heuristic: a real browser has `window` but no `process`. Bun, Node,
+    // Deno, and Cloudflare Workers all have `process` (Bun shims it on the
+    // global). Known limits: Electron renderer and some bundler-shimmed
+    // browser builds (Vite/webpack `define: { process }`) will pass; this
+    // is acceptable because the *real* protection is the secretApiKey
+    // never reaching a browser bundle. Don't "simplify" this casually.
     if (typeof window !== 'undefined' && !('process' in globalThis)) {
       throw new Error('@sessionsight/flags is a server-side SDK and cannot be used in the browser.');
     }
@@ -29,6 +49,8 @@ export class FeatureFlagClient {
     this.propertyId = config.propertyId;
     this.environment = config.environment;
     this.apiUrl = normalizeApiUrl(config.apiUrl || '');
+    this.timeoutMs = typeof config.timeoutMs === 'number' && config.timeoutMs > 0 ? config.timeoutMs : FETCH_TIMEOUT_MS;
+    this.logger = config.logger ?? console;
   }
 
   async init(context?: FlagEvaluationContext): Promise<void> {
@@ -55,33 +77,71 @@ export class FeatureFlagClient {
   }
 
   async getFlags(): Promise<FlagListResult> {
+    let response: Response;
     try {
-      const res = await fetchWithTimeout(`${this.apiUrl}/v1/flags/list?propertyId=${encodeURIComponent(this.propertyId)}`, {
-        method: 'GET',
-        headers: { 'x-api-key': this.secretApiKey },
-      });
-
-      if (!res.ok) {
-        console.warn(`[SessionSight Flags] Failed to list flags: ${res.status}`);
-        return { flags: [] };
+      response = await fetchWithTimeout(
+        `${this.apiUrl}/v1/flags/list?propertyId=${encodeURIComponent(this.propertyId)}`,
+        {
+          method: 'GET',
+          headers: { 'x-api-key': this.secretApiKey },
+        },
+        this.timeoutMs,
+      );
+    } catch (error) {
+      // The shared fetchWithTimeout aborts via AbortController on timeout,
+      // surfacing an AbortError. Preserve the distinctive timeout log so
+      // operators can tell timeouts apart from generic network errors.
+      if ((error as { name?: string } | null)?.name === 'AbortError') {
+        this.logger.warn(`[SessionSight Flags] Failed to list flags: request timed out after ${this.timeoutMs}ms`);
+      } else {
+        this.logger.warn('[SessionSight Flags] Failed to list flags:', error);
       }
+      return { flags: [] };
+    }
 
-      const data = await res.json();
+    if (!response.ok) {
+      const body = await readBodyExcerpt(response);
+      this.logger.warn(`[SessionSight Flags] HTTP ${response.status}: ${body}`);
+      return { flags: [] };
+    }
+
+    try {
+      const data = await response.json();
       return { flags: data.flags || [] };
     } catch (err) {
-      console.warn('[SessionSight Flags] Failed to list flags:', err);
+      this.logger.warn('[SessionSight Flags] Failed to parse flags list response:', err);
       return { flags: [] };
     }
   }
 
+  /**
+   * Drop all client state, including credentials. After `destroy()` the
+   * instance is unusable; create a new client to resume.
+   */
   destroy(): void {
     this.flags = {};
     this.context = {};
     this.initialized = false;
+    this.secretApiKey = '';
   }
 
   isInitialized(): boolean {
     return this.initialized;
+  }
+
+  /** Read-only snapshot of currently-cached flags. Used by per-request wrappers. */
+  getFlagSnapshot(): EvaluatedFlags {
+    return this.flags;
+  }
+
+  /**
+   * Internal: evaluate flags for a one-off context without mutating the
+   * shared `this.flags` map. Used by `BoundFeatureFlagClient` to cache
+   * flags per-request, so concurrent requests with different visitors
+   * don't see each other's evaluations.
+   */
+  async evaluateForContext(context: FlagEvaluationContext): Promise<EvaluatedFlags> {
+    return this.fetchFlagsRaw(context);
   }
 
   /**
@@ -93,40 +153,70 @@ export class FeatureFlagClient {
    *   const flags = client.forRequest(req);
    *   await flags.init({ userId: req.user.id });
    *   flags.getBooleanFlag('new-ui', false);
+   *
+   * The returned `BoundFeatureFlagClient` carries its OWN flag cache:
+   * each `forRequest(...)` instance evaluates and stores flags in
+   * isolation, so two concurrent requests with different visitor cookies
+   * never see each other's values.
    */
   forRequest(req: unknown): BoundFeatureFlagClient {
     return new BoundFeatureFlagClient(this, extractIdsFromRequest(req));
   }
 
   private async fetchFlags(): Promise<void> {
+    const flags = await this.fetchFlagsRaw(this.context);
+    if (flags) this.flags = flags;
+  }
+
+  /**
+   * Pure transport: POST `/v1/flags/evaluate` with the given context and
+   * return the evaluated flags map (or an empty map on failure).
+   * Does not touch any instance state except `apiUrl`/credentials/logger.
+   */
+  private async fetchFlagsRaw(context: FlagEvaluationContext): Promise<EvaluatedFlags> {
+    let response: Response;
     try {
-      const res = await fetchWithTimeout(`${this.apiUrl}/v1/flags/evaluate`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': this.secretApiKey,
+      response = await fetchWithTimeout(
+        `${this.apiUrl}/v1/flags/evaluate`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-api-key': this.secretApiKey,
+          },
+          body: JSON.stringify({
+            propertyId: this.propertyId,
+            environment: this.environment,
+            context,
+          }),
         },
-        body: JSON.stringify({
-          propertyId: this.propertyId,
-          environment: this.environment,
-          context: this.context,
-        }),
-      });
-
-      if (!res.ok) {
-        console.warn(`[SessionSight Flags] Failed to fetch flags: ${res.status}`);
-        return;
+        this.timeoutMs,
+      );
+    } catch (error) {
+      if ((error as { name?: string } | null)?.name === 'AbortError') {
+        this.logger.warn(`[SessionSight Flags] Failed to fetch flags: request timed out after ${this.timeoutMs}ms`);
+      } else {
+        this.logger.warn('[SessionSight Flags] Failed to fetch flags:', error);
       }
+      return {};
+    }
 
-      const data = await res.json();
-      this.flags = data.flags || {};
+    if (!response.ok) {
+      const body = await readBodyExcerpt(response);
+      this.logger.warn(`[SessionSight Flags] HTTP ${response.status}: ${body}`);
+      return {};
+    }
 
+    try {
+      const data = await response.json();
       // Write opaque evaluation token to cross-SDK registry for insights SDK to pick up
       if (data.evaluationToken) {
         setRegistryValue('flagEvaluationToken', data.evaluationToken);
       }
+      return data.flags || {};
     } catch (err) {
-      console.warn('[SessionSight Flags] Failed to fetch flags:', err);
+      this.logger.warn('[SessionSight Flags] Failed to parse evaluate response:', err);
+      return {};
     }
   }
 }
@@ -137,35 +227,42 @@ export class FeatureFlagClient {
  * segment targeting lands on the right visitor without the host plumbing it
  * through manually.
  *
- * Reads (`getBooleanFlag` / `getStringFlag` / `getFlags`) delegate to the
- * underlying client, since flag *values* are the same across requests once
- * fetched. Context only affects which values are fetched.
+ * Each `BoundFeatureFlagClient` carries its own `flags` map populated on
+ * `init()`/`refresh()`. Reads (`getBooleanFlag` / `getStringFlag`) hit this
+ * per-request map, so two concurrent requests with different visitor
+ * cookies never see each other's values.
  *
- * Note: the underlying `FeatureFlagClient` holds a single shared flag cache.
- * If you need per-request evaluation (different flag values per visitor),
- * call `forRequest(req).refresh()` before reading — or instantiate a
- * per-request `FeatureFlagClient`.
+ * `getFlags()` (flag-definition list) delegates to the underlying client
+ * since definitions are property-wide and don't depend on context.
  */
 export class BoundFeatureFlagClient {
+  private flags: EvaluatedFlags = {};
+  private initialized = false;
+
   constructor(
     private readonly client: FeatureFlagClient,
     private readonly bound: { visitorId: string | null; sessionId: string | null },
   ) {}
 
   async init(context?: FlagEvaluationContext): Promise<void> {
-    return this.client.init(this.merge(context));
+    this.flags = await this.client.evaluateForContext(this.merge(context));
+    this.initialized = true;
   }
 
   async refresh(context?: FlagEvaluationContext): Promise<void> {
-    return this.client.refresh(this.merge(context));
+    this.flags = await this.client.evaluateForContext(this.merge(context));
   }
 
   getBooleanFlag(key: string, defaultValue: boolean): boolean {
-    return this.client.getBooleanFlag(key, defaultValue);
+    const flag = this.flags[key];
+    if (!flag || flag.type !== 'boolean') return defaultValue;
+    return typeof flag.value === 'boolean' ? flag.value : defaultValue;
   }
 
   getStringFlag(key: string, defaultValue: string): string {
-    return this.client.getStringFlag(key, defaultValue);
+    const flag = this.flags[key];
+    if (!flag || flag.type !== 'string') return defaultValue;
+    return typeof flag.value === 'string' ? flag.value : defaultValue;
   }
 
   getFlags(): Promise<FlagListResult> {
@@ -173,7 +270,7 @@ export class BoundFeatureFlagClient {
   }
 
   isInitialized(): boolean {
-    return this.client.isInitialized();
+    return this.initialized;
   }
 
   private merge(context?: FlagEvaluationContext): FlagEvaluationContext {

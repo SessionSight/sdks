@@ -1,4 +1,11 @@
 import { test, expect, describe, beforeEach, afterEach, mock } from 'bun:test';
+import {
+  MAX_ID_LEN,
+  MAX_EMAIL_LEN,
+  MAX_CUSTOM_KEY_LEN,
+  MAX_CUSTOM_VALUE_LEN,
+  MAX_CUSTOM_PROPERTY_COUNT,
+} from '@sessionsight/sdk-shared';
 
 // ── Browser global stubs (same pattern as goals-namespace.test.ts) ──
 
@@ -19,7 +26,12 @@ const origHistory = (globalThis as any).history;
 const origHistoryCtor = (globalThis as any).History;
 const origLocation = (globalThis as any).location;
 
-const identifyCalls: Array<{ stableId: string; properties: Record<string, any> | undefined }> = [];
+interface RecordedIdentify {
+  id?: string;
+  email?: string;
+  customProperties?: Record<string, any>;
+}
+const identifyCalls: RecordedIdentify[] = [];
 
 beforeEach(() => {
   listeners.clear();
@@ -82,10 +94,12 @@ mock.module('../src/worker-bridge.js', () => ({
     onQuotaExceeded(_cb: Function) {}
     onRotate(_cb: Function) {}
     onKilled(_cb: Function) {}
+    onVisitorIdSwap(_cb: Function) {}
     postEvent() {}
     postMetadata() {}
     postIdentify() {}
     flush() {}
+    flushAndDestroy() {}
     sendBeacon() {}
     destroy() {}
   },
@@ -97,8 +111,8 @@ mock.module('../src/recorder.js', () => ({
     start() {}
     stop() {}
     beginRecording() {}
-    identify(stableId: string, properties?: Record<string, any>) {
-      identifyCalls.push({ stableId, properties });
+    identify(payload: RecordedIdentify) {
+      identifyCalls.push(payload);
     }
     getVisitorId() { return null; }
     getBridge() { return {}; }
@@ -116,123 +130,191 @@ async function freshSessionSight() {
   return SessionSight;
 }
 
-describe('SessionSight.identify PII handling', () => {
-  describe('stableId: allowed values', () => {
-    test('email passes through', async () => {
+describe('SessionSight.identify (flat shape)', () => {
+  describe('routing: id / email / customProperties', () => {
+    test('id alone routes to the id slot', async () => {
       const ss = await freshSessionSight();
-      ss.identify('alice@acme.com');
+      ss.identify({ id: 'user_abc' });
       expect(identifyCalls).toHaveLength(1);
-      expect(identifyCalls[0]!.stableId).toBe('alice@acme.com');
+      expect(identifyCalls[0]).toEqual({ id: 'user_abc' });
     });
 
-    test('UUID passes through', async () => {
+    test('email alone routes to the email slot', async () => {
       const ss = await freshSessionSight();
-      ss.identify('550e8400-e29b-41d4-a716-446655440000');
+      ss.identify({ email: 'alice@acme.com' });
       expect(identifyCalls).toHaveLength(1);
-      expect(identifyCalls[0]!.stableId).toBe('550e8400-e29b-41d4-a716-446655440000');
+      expect(identifyCalls[0]).toEqual({ email: 'alice@acme.com' });
     });
 
-    test('opaque app-internal id passes through', async () => {
+    test('id + email + custom routes to all three slots', async () => {
       const ss = await freshSessionSight();
-      ss.identify('user-abc-123');
+      ss.identify({ id: 'user_abc', email: 'alice@acme.com', plan: 'pro', signupAt: 1730000000 });
       expect(identifyCalls).toHaveLength(1);
-      expect(identifyCalls[0]!.stableId).toBe('user-abc-123');
+      expect(identifyCalls[0]).toEqual({
+        id: 'user_abc',
+        email: 'alice@acme.com',
+        customProperties: { plan: 'pro', signupAt: 1730000000 },
+      });
+    });
+
+    test('properties-only call (no id, no email) is valid', async () => {
+      const ss = await freshSessionSight();
+      ss.identify({ plan: 'pro', team: 'platform' });
+      expect(identifyCalls).toHaveLength(1);
+      expect(identifyCalls[0]).toEqual({
+        customProperties: { plan: 'pro', team: 'platform' },
+      });
+    });
+
+    test('empty object is a no-op (no recorder call)', async () => {
+      const ss = await freshSessionSight();
+      ss.identify({});
+      expect(identifyCalls).toHaveLength(0);
+    });
+
+    test('undefined values are stripped (treated as absent)', async () => {
+      const ss = await freshSessionSight();
+      ss.identify({ id: undefined, email: undefined, plan: 'pro' });
+      expect(identifyCalls).toHaveLength(1);
+      expect(identifyCalls[0]).toEqual({ customProperties: { plan: 'pro' } });
     });
   });
 
-  describe('stableId: rejected (throws)', () => {
-    test('SSN throws', async () => {
+  describe('email normalization', () => {
+    test('mixed-case email is lowercased', async () => {
       const ss = await freshSessionSight();
-      expect(() => ss.identify('123-45-6789')).toThrow(/prohibited PII/);
-      expect(identifyCalls).toHaveLength(0);
+      ss.identify({ email: 'Alice@Acme.COM' });
+      expect(identifyCalls[0]!.email).toBe('alice@acme.com');
     });
 
-    test('Luhn-valid credit card throws', async () => {
+    test('whitespace around email is trimmed', async () => {
       const ss = await freshSessionSight();
-      expect(() => ss.identify('4111 1111 1111 1111')).toThrow(/prohibited PII/);
-      expect(identifyCalls).toHaveLength(0);
-    });
-
-    test('Anthropic-style API key throws', async () => {
-      const ss = await freshSessionSight();
-      expect(() => ss.identify('sk-ant-abcdefghijklmnopqrstuvwxyz01')).toThrow(/prohibited PII/);
-      expect(identifyCalls).toHaveLength(0);
-    });
-
-    test('US phone throws', async () => {
-      const ss = await freshSessionSight();
-      expect(() => ss.identify('+1 555 123 4567')).toThrow(/prohibited PII/);
-      expect(identifyCalls).toHaveLength(0);
-    });
-
-    test('JWT throws', async () => {
-      const ss = await freshSessionSight();
-      expect(() => ss.identify('eyJhbGciOiJIUzI1NiIsInR5.eyJzdWIiOiIxMjM0NTY3ODkw.SflKxwRJSMeKKF2QT4fwpMeJf36P')).toThrow(/prohibited PII/);
-      expect(identifyCalls).toHaveLength(0);
+      ss.identify({ email: '  alice@acme.com  ' });
+      expect(identifyCalls[0]!.email).toBe('alice@acme.com');
     });
   });
 
-  describe('properties: sanitization', () => {
+  describe('id slot: rejected (throws)', () => {
+    test('email-shaped value in id throws', async () => {
+      const ss = await freshSessionSight();
+      expect(() => ss.identify({ id: 'alice@acme.com' })).toThrow(/email-shaped/);
+      expect(identifyCalls).toHaveLength(0);
+    });
+
+    test('SSN in id throws', async () => {
+      const ss = await freshSessionSight();
+      expect(() => ss.identify({ id: '123-45-6789' })).toThrow(/prohibited PII/);
+      expect(identifyCalls).toHaveLength(0);
+    });
+
+    test('Luhn-valid credit card in id throws', async () => {
+      const ss = await freshSessionSight();
+      expect(() => ss.identify({ id: '4111 1111 1111 1111' })).toThrow(/prohibited PII/);
+      expect(identifyCalls).toHaveLength(0);
+    });
+
+    test('id longer than MAX_ID_LEN throws', async () => {
+      const ss = await freshSessionSight();
+      const tooLong = 'a'.repeat(MAX_ID_LEN + 1);
+      expect(() => ss.identify({ id: tooLong })).toThrow(new RegExp(`${MAX_ID_LEN} characters`));
+    });
+
+    test('empty id throws', async () => {
+      const ss = await freshSessionSight();
+      expect(() => ss.identify({ id: '' })).toThrow(/non-empty/);
+    });
+  });
+
+  describe('email slot: rejected (throws)', () => {
+    test('invalid email shape throws', async () => {
+      const ss = await freshSessionSight();
+      expect(() => ss.identify({ email: 'not-an-email' })).toThrow(/valid email shape/);
+    });
+
+    test('email without TLD throws', async () => {
+      const ss = await freshSessionSight();
+      expect(() => ss.identify({ email: 'foo@bar' })).toThrow(/valid email shape/);
+    });
+
+    test('email longer than MAX_EMAIL_LEN throws', async () => {
+      const ss = await freshSessionSight();
+      const local = 'a'.repeat(MAX_EMAIL_LEN);
+      expect(() => ss.identify({ email: `${local}@acme.com` })).toThrow(new RegExp(`${MAX_EMAIL_LEN} characters`));
+    });
+
+    test('email with whitespace throws (post-trim still invalid)', async () => {
+      const ss = await freshSessionSight();
+      expect(() => ss.identify({ email: 'alice @acme.com' })).toThrow(/valid email shape/);
+    });
+  });
+
+  describe('custom properties: sanitization (silent drop)', () => {
     test('drops entry when value contains SSN', async () => {
       const ss = await freshSessionSight();
-      ss.identify('user-1', { plan: 'pro', ssn: '123-45-6789' });
-      expect(identifyCalls).toHaveLength(1);
-      expect(identifyCalls[0]!.properties).toEqual({ plan: 'pro' });
+      ss.identify({ id: 'user_abc', plan: 'pro', ssn: '123-45-6789' });
+      expect(identifyCalls[0]!.customProperties).toEqual({ plan: 'pro' });
     });
 
     test('drops entry when value contains phone', async () => {
       const ss = await freshSessionSight();
-      ss.identify('user-1', { plan: 'pro', notes: 'call me at 555-123-4567' });
-      expect(identifyCalls).toHaveLength(1);
-      expect(identifyCalls[0]!.properties).toEqual({ plan: 'pro' });
+      ss.identify({ id: 'user_abc', plan: 'pro', notes: 'call me at 555-123-4567' });
+      expect(identifyCalls[0]!.customProperties).toEqual({ plan: 'pro' });
     });
 
     test('drops entry when key matches prohibited PII', async () => {
       const ss = await freshSessionSight();
-      ss.identify('user-1', { '123-45-6789': 'some value', plan: 'pro' });
-      expect(identifyCalls).toHaveLength(1);
-      expect(identifyCalls[0]!.properties).toEqual({ plan: 'pro' });
+      ss.identify({ id: 'user_abc', '123-45-6789': 'some value', plan: 'pro' });
+      expect(identifyCalls[0]!.customProperties).toEqual({ plan: 'pro' });
     });
 
-    test('preserves email in property key and value (email is allowed)', async () => {
+    test('preserves email in property values (per-value PII skipEmail)', async () => {
       const ss = await freshSessionSight();
-      ss.identify('user-1', { 'alice@acme.com': 'friend', contact: 'bob@acme.com', plan: 'pro' });
-      expect(identifyCalls).toHaveLength(1);
-      expect(identifyCalls[0]!.properties).toEqual({
-        'alice@acme.com': 'friend',
+      ss.identify({ id: 'user_abc', contact: 'bob@acme.com', plan: 'pro' });
+      expect(identifyCalls[0]!.customProperties).toEqual({
         contact: 'bob@acme.com',
         plan: 'pro',
       });
     });
 
-    test('passes numeric and boolean values through unchanged', async () => {
+    test('numeric and boolean values pass through unchanged', async () => {
       const ss = await freshSessionSight();
-      ss.identify('user-1', { score: 42, active: true, rank: 3.14 });
-      expect(identifyCalls).toHaveLength(1);
-      expect(identifyCalls[0]!.properties).toEqual({ score: 42, active: true, rank: 3.14 });
+      ss.identify({ id: 'user_abc', score: 42, active: true, rank: 3.14 });
+      expect(identifyCalls[0]!.customProperties).toEqual({ score: 42, active: true, rank: 3.14 });
+    });
+  });
+
+  describe('custom properties: rejected (throws)', () => {
+    test('custom property key longer than MAX_CUSTOM_KEY_LEN throws', async () => {
+      const ss = await freshSessionSight();
+      const longKey = 'k'.repeat(MAX_CUSTOM_KEY_LEN + 1);
+      expect(() => ss.identify({ id: 'user_abc', [longKey]: 'v' })).toThrow(new RegExp(`${MAX_CUSTOM_KEY_LEN} characters`));
     });
 
-    test('clean properties pass through untouched', async () => {
+    test('custom property string value longer than MAX_CUSTOM_VALUE_LEN throws', async () => {
       const ss = await freshSessionSight();
-      ss.identify('user-1', { plan: 'pro', accountType: 'enterprise', role: 'admin' });
-      expect(identifyCalls).toHaveLength(1);
-      expect(identifyCalls[0]!.properties).toEqual({
-        plan: 'pro',
-        accountType: 'enterprise',
-        role: 'admin',
-      });
+      const longValue = 'v'.repeat(MAX_CUSTOM_VALUE_LEN + 1);
+      expect(() => ss.identify({ id: 'user_abc', big: longValue })).toThrow(new RegExp(`${MAX_CUSTOM_VALUE_LEN} characters`));
     });
 
-    test('drops multiple PII entries in one call', async () => {
+    test('more than MAX_CUSTOM_PROPERTY_COUNT properties throws', async () => {
       const ss = await freshSessionSight();
-      ss.identify('user-1', {
-        ssn: '123-45-6789',
-        card: '4111 1111 1111 1111',
-        apiKey: 'sk-ant-abcdefghijklmnopqrstuvwxyz01',
-        plan: 'pro',
-      });
+      const payload: Record<string, string> = { id: 'user_abc' };
+      for (let i = 0; i < MAX_CUSTOM_PROPERTY_COUNT + 1; i++) payload[`k${i}`] = `v${i}`;
+      expect(() => ss.identify(payload)).toThrow(new RegExp(`at most ${MAX_CUSTOM_PROPERTY_COUNT}`));
+    });
+
+    test('exactly MAX_CUSTOM_PROPERTY_COUNT properties is allowed (id/email do not count)', async () => {
+      const ss = await freshSessionSight();
+      const payload: Record<string, string> = { id: 'user_abc', email: 'alice@acme.com' };
+      for (let i = 0; i < MAX_CUSTOM_PROPERTY_COUNT; i++) payload[`k${i}`] = `v${i}`;
+      ss.identify(payload);
       expect(identifyCalls).toHaveLength(1);
-      expect(identifyCalls[0]!.properties).toEqual({ plan: 'pro' });
+      expect(Object.keys(identifyCalls[0]!.customProperties!).length).toBe(MAX_CUSTOM_PROPERTY_COUNT);
+    });
+
+    test('wrong-type custom property value throws', async () => {
+      const ss = await freshSessionSight();
+      expect(() => ss.identify({ id: 'user_abc', data: { nested: 'not allowed' } as any })).toThrow(/string, number, or boolean/);
     });
   });
 });

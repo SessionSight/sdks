@@ -183,7 +183,7 @@ describe('session cookie helpers', () => {
       value: {
         get cookie() { return cookieStore; },
         set cookie(v: string) {
-          // v is "name=value; path=/; ..." — strip attributes, keep name=value.
+          // v is "name=value; path=/; ..."; strip attributes, keep name=value.
           const pair = v.split(';')[0]!.trim();
           const [name] = pair.split('=');
           // Remove any existing entry for this name, then append.

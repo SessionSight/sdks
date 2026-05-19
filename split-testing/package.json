@@ -53,7 +53,7 @@
     "verify-hint": "bun run scripts/verify-hint.ts",
     "prebuild": "bun run verify-hint",
     "prepublishOnly": "bun run verify-hint",
-    "build": "bun run build:esm && bun run build:iife",
+    "build": "rm -rf dist && bun run build:esm && bun run build:iife",
     "build:esm": "bun build src/index.ts --outdir dist --format esm && bun x tsc --emitDeclarationOnly --declaration --outDir dist",
     "build:iife": "bun build src/iife.ts --outfile dist/sessionsight-split-testing.js --format iife --minify"
   },
@@ -62,8 +62,5 @@
   },
   "dependencies": {
     "@sessionsight/sdk-shared": "workspace:*"
-  },
-  "devDependencies": {
-    "@sessionsight/backend-shared": "workspace:*"
   }
 }

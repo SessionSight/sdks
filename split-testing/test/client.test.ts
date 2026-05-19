@@ -181,3 +181,168 @@ test('destroy clears internal state', async () => {
   // After destroy, get() should return default
   expect(client.get('hero-test', 'fallback')).toBe('fallback');
 });
+
+// ════════════════════════════════════════════════════════════════════
+//  H2: Cached assignments are sticky across config changes
+// ════════════════════════════════════════════════════════════════════
+
+test('exposed visitor stays bucketed even after config hashSeed changes', async () => {
+  // Pre-cache an assignment landing the visitor on variant-a.
+  setCachedAssignments(PROPERTY, VISITOR, {
+    'hero-test': {
+      testKey: 'hero-test',
+      variationIndex: 1,
+      variationKey: 'variant-a',
+      value: 'Hey there',
+      type: 'text',
+      inTest: true,
+    },
+  });
+
+  // Live config has a NEW hashSeed and the variation `value` was edited.
+  // Without sticky-assignment, evaluateAssignments would re-hash with the
+  // new seed and could land the visitor on `control` instead.
+  const changedConfig: SplitTestConfigResponse = {
+    tests: [
+      {
+        key: 'hero-test',
+        id: 'test-id-1',
+        type: 'text',
+        status: 'running',
+        hashSeed: 'completely-different-seed-xyz',
+        trafficAllocation: 100,
+        variations: [
+          { key: 'control', weight: 50, value: 'Hello' },
+          { key: 'variant-a', weight: 50, value: 'Hey there (edited)' },
+        ],
+      },
+    ],
+  } as any;
+  setCachedConfig(PROPERTY, changedConfig);
+
+  const client = makeClient({ maxAge: 999_999_999, staleTTL: 999_999_999 });
+  await client.init();
+
+  const assignments = client.getAssignments();
+  // Visitor must remain bucketed on variant-a (index 1), not silently
+  // re-bucketed onto control by the new hashSeed.
+  expect(assignments['hero-test']).toBe(1);
+
+  // The variation `value` should have refreshed from the live config so
+  // the integrator sees the latest content for the same bucket.
+  const value = client.get('hero-test', 'fallback');
+  expect(value).toBe('Hey there (edited)');
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  H3: Per-instance exposure dedup persists across flushes
+// ════════════════════════════════════════════════════════════════════
+
+test('only one POST per (sessionId, testKey) per instance, even after flush', async () => {
+  // Install a cookie store so the SDK has a session to key exposures to.
+  let cookieStore = 'ss_sid=sess-h3';
+  Object.defineProperty(globalThis, 'document', {
+    value: {
+      createElement: () => ({ id: '', textContent: '', remove() {} }),
+      head: { appendChild() {} },
+      get cookie() { return cookieStore; },
+      set cookie(v: string) { cookieStore = v; },
+    },
+    writable: true,
+    configurable: true,
+  });
+
+  const beaconCalls: Array<{ url: string; body: string }> = [];
+  globalThis.navigator = {
+    sendBeacon: (url: string, blob: Blob) => {
+      // Capture the blob body via a synchronously-stashed text snapshot.
+      // bun's Blob.text() is async, so we tag the blob and await later.
+      (blob as any)._capturedUrl = url;
+      beaconCalls.push({ url, body: '' });
+      // Read body asynchronously and store on the call entry.
+      (blob.text() as Promise<string>).then((t) => {
+        const last = beaconCalls[beaconCalls.length - 1]!;
+        last.body = t;
+      });
+      return true;
+    },
+  } as any;
+
+  setCachedConfig(PROPERTY, fakeConfigResponse);
+
+  const client = makeClient({ maxAge: 999_999_999, staleTTL: 999_999_999 });
+  await client.init();
+
+  // First get(): queues an exposure, and instance-lifetime dedup adds
+  // testKey to exposedTestKeys.
+  client.get('hero-test', 'fallback');
+  // Force-flush to clear pendingExposures queue.
+  (client as any).flushExposures();
+
+  expect(beaconCalls.length).toBe(1);
+
+  // Subsequent get() calls in the same instance must not queue another
+  // POST: the in-flight queue is empty after flush, but the per-instance
+  // dedup set still records that we've fired for this testKey.
+  client.get('hero-test', 'fallback');
+  client.get('hero-test', 'fallback');
+  (client as any).flushExposures();
+
+  expect(beaconCalls.length).toBe(1);
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  M2: destroy() aborts in-flight background fetchConfig writes
+// ════════════════════════════════════════════════════════════════════
+
+test('destroy() prevents a late background fetch from writing onto a torn-down instance', async () => {
+  // Stale cached config so init() takes the cache path and schedules a
+  // background refetch.
+  setCachedConfig(PROPERTY, fakeConfigResponse);
+
+  // Stall the fetch indefinitely; we resolve it manually after destroy().
+  let resolveFetch: ((res: Response) => void) | null = null;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = mock((_url: string | URL | Request) => new Promise<Response>((resolve) => {
+    resolveFetch = resolve;
+  })) as any;
+
+  try {
+    const client = makeClient({ maxAge: 999_999_999, staleTTL: 0 });
+    await client.init();
+
+    // Tear down before the background fetch completes.
+    client.destroy();
+
+    // Now resolve the in-flight fetch with a different config (different
+    // hashSeed). If destroy()'s abort guard works, the post-await write
+    // is skipped; otherwise client.config gets repopulated on a destroyed
+    // instance.
+    const lateConfig: SplitTestConfigResponse = {
+      tests: [
+        {
+          key: 'late-test',
+          id: 'late-id',
+          type: 'text',
+          status: 'running',
+          hashSeed: 'late-seed',
+          trafficAllocation: 100,
+          variations: [
+            { key: 'control', weight: 100, value: 'late' },
+          ],
+        },
+      ],
+    } as any;
+    resolveFetch!(new Response(JSON.stringify(lateConfig), { status: 200 }));
+
+    // Drain microtasks so the .then() handlers run.
+    await new Promise((r) => setTimeout(r, 0));
+
+    // Internal state must remain torn down; config not repopulated and
+    // assignments empty.
+    expect((client as any).config).toBeNull();
+    expect(Object.keys((client as any).assignments).length).toBe(0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});

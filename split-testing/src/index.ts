@@ -1,5 +1,5 @@
 import { SplitTestingClient, BoundSplitTestingClient } from './client.js';
-import type { SplitTestConfig, GetOptions, AssignedVariation } from './types.js';
+import type { SplitTestConfig, GetOptions } from './types.js';
 
 export { SplitTestingClient, BoundSplitTestingClient };
 export type { SplitTestConfig, GetOptions, AssignedVariation, Assignment, SplitTestConfigResponse } from './types.js';
@@ -58,7 +58,7 @@ const SplitTesting = {
 
   /**
    * Per-request helper (SSR / Node). In the browser, ss_sid is read from
-   * `document.cookie` automatically on each exposure flush — this helper is
+   * `document.cookie` automatically on each exposure flush. This helper is
    * only needed on the server, where cookies live on the inbound request.
    */
   forRequest(req: unknown): BoundSplitTestingClient | null {

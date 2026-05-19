@@ -1,8 +1,7 @@
 import { test, expect, describe, beforeEach } from 'bun:test';
 
 /**
- * Spec tests for the dataLayer listener described in
- * dev-docs/plans/GTM_INTEGRATION_PLAN.md.
+ * Spec tests for the dataLayer listener.
  *
  * The SDK implementation of `installDataLayerListener` does not exist yet.
  * This file contains a reference implementation inline (see `installDataLayerListener`
@@ -196,7 +195,7 @@ describe('dataLayer listener: forward behavior', () => {
 });
 
 describe('dataLayer listener: composition with GTM-style wrappers', () => {
-  test('Case 1: we patch first, GTM wraps on top — both see every event', () => {
+  test('Case 1: we patch first, GTM wraps on top: both see every event', () => {
     const ssSeen: any[] = [];
     const gtmSeen: any[] = [];
 
@@ -210,7 +209,7 @@ describe('dataLayer listener: composition with GTM-style wrappers', () => {
     expect(win.dataLayer.length).toBe(1);
   });
 
-  test('Case 2: GTM patches first, we wrap on top — both see every event', () => {
+  test('Case 2: GTM patches first, we wrap on top: both see every event', () => {
     const ssSeen: any[] = [];
     const gtmSeen: any[] = [];
 
@@ -226,7 +225,7 @@ describe('dataLayer listener: composition with GTM-style wrappers', () => {
     expect(win.dataLayer.length).toBe(1);
   });
 
-  test('Case 4: multiple wrappers stack — every party sees the event once, underlying array has one copy', () => {
+  test('Case 4: multiple wrappers stack, every party sees the event once, underlying array has one copy', () => {
     const ssSeen: any[] = [];
     const thirdPartySeen: any[] = [];
     const gtmSeen: any[] = [];
@@ -245,7 +244,7 @@ describe('dataLayer listener: composition with GTM-style wrappers', () => {
 });
 
 describe('dataLayer listener: reassignment guard', () => {
-  test('Case 3: window.dataLayer reassigned to [] — subsequent pushes still forward', () => {
+  test('Case 3: window.dataLayer reassigned to []; subsequent pushes still forward', () => {
     const seen: any[] = [];
     install((e) => seen.push(e));
 
@@ -360,7 +359,7 @@ function stopLifecycle(state: LifecycleState): void {
 }
 
 describe('dataLayer listener: lifecycle gating (goals consent model)', () => {
-  test('never inited — no goalsConfig, forwards are dropped', () => {
+  test('never inited: no goalsConfig, forwards are dropped', () => {
     const state: LifecycleState = {
       goalsConfig: null,
       storedVisitorId: '',
@@ -375,7 +374,7 @@ describe('dataLayer listener: lifecycle gating (goals consent model)', () => {
     expect(sink).toEqual([]);
   });
 
-  test('inited normally — forwards with visitor and session attribution', () => {
+  test('inited normally: forwards with visitor and session attribution', () => {
     const state: LifecycleState = {
       goalsConfig: null,
       storedVisitorId: '',
@@ -393,7 +392,7 @@ describe('dataLayer listener: lifecycle gating (goals consent model)', () => {
     ]);
   });
 
-  test('setEnabled(false) after init — still forwards with attribution (goals model)', () => {
+  test('setEnabled(false) after init: still forwards with attribution (goals model)', () => {
     const state: LifecycleState = {
       goalsConfig: null,
       storedVisitorId: '',
@@ -412,7 +411,7 @@ describe('dataLayer listener: lifecycle gating (goals consent model)', () => {
     ]);
   });
 
-  test('stop() after init — forwards without attribution (ids stripped, goalsConfig retained)', () => {
+  test('stop() after init: forwards without attribution (ids stripped, goalsConfig retained)', () => {
     const state: LifecycleState = {
       goalsConfig: null,
       storedVisitorId: '',
@@ -430,7 +429,7 @@ describe('dataLayer listener: lifecycle gating (goals consent model)', () => {
     expect(state.goalsConfig).not.toBeNull();
   });
 
-  test('init() again after stop() — forwards resume with attribution', () => {
+  test('init() again after stop(): forwards resume with attribution', () => {
     const state: LifecycleState = {
       goalsConfig: null,
       storedVisitorId: '',

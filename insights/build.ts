@@ -2,8 +2,8 @@
  * Build script for the SessionSight Insights SDK.
  *
  * Supports two modes:
- *   bun run build:worker  — generate _worker-bundle.ts only (for dev)
- *   bun run build         — full build (worker + ESM + types + IIFE)
+ *   bun run build:worker  : generate _worker-bundle.ts only (for dev)
+ *   bun run build         : full build (worker + ESM + types + IIFE)
  *
  * The _worker-bundle.ts file is gitignored but required on disk so the
  * dev server can resolve the static import in worker-inline.ts.

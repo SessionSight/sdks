@@ -20,7 +20,11 @@
     "sessionsight"
   ],
   "files": [
-    "dist"
+    "dist/index.js",
+    "dist/index.d.ts",
+    "dist/client.d.ts",
+    "dist/types.d.ts",
+    "dist/integration-hint.d.ts"
   ],
   "type": "module",
   "main": "./src/index.ts",
@@ -51,8 +55,9 @@
   },
   "scripts": {
     "verify-hint": "bun run scripts/verify-hint.ts",
+    "check-no-iife": "bun run scripts/check-no-iife.ts",
     "prebuild": "bun run verify-hint",
-    "prepublishOnly": "bun run verify-hint",
+    "prepublishOnly": "bun run verify-hint && bun run check-no-iife",
     "build": "rm -rf dist && bun build src/index.ts --outdir dist --format esm && bun x tsc --emitDeclarationOnly --declaration --outDir dist"
   },
   "peerDependencies": {
@@ -60,8 +65,5 @@
   },
   "dependencies": {
     "@sessionsight/sdk-shared": "workspace:*"
-  },
-  "devDependencies": {
-    "@sessionsight/backend-shared": "workspace:*"
   }
 }

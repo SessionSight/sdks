@@ -70,10 +70,16 @@ test('assignVariation respects unequal weights', () => {
     ]);
     counts[result.variationIndex]!++;
   }
-  // control ~70%, variant-a ~20%, variant-b ~10%
-  expect(counts[0]).toBeGreaterThan(6000);
-  expect(counts[1]).toBeGreaterThan(1000);
+  // control ~70%, variant-a ~20%, variant-b ~10%. The bounds below are
+  // tight enough to fail if any bucket drifts more than ~5pp from its
+  // weight: a 50/40/10 distribution would fail (control 5000 < 6500,
+  // variant-a 4000 > 2500), and 70/20/10 sits comfortably in range.
+  expect(counts[0]).toBeGreaterThan(6500);
+  expect(counts[0]).toBeLessThan(7500);
+  expect(counts[1]).toBeGreaterThan(1500);
+  expect(counts[1]).toBeLessThan(2500);
   expect(counts[2]).toBeGreaterThan(500);
+  expect(counts[2]).toBeLessThan(1500);
 });
 
 test('assignVariation handles zero traffic allocation', () => {

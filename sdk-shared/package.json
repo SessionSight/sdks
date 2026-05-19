@@ -1,0 +1,57 @@
+{
+  "name": "@sessionsight/sdk-shared",
+  "version": "1.0.0",
+  "description": "Shared utilities for the SessionSight SDKs (PII redaction, stable selectors, visitor-id handling).",
+  "author": "SessionSight",
+  "license": "MIT",
+  "homepage": "https://sessionsight.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/SessionSight/sdks.git",
+    "directory": "packages/sdk-shared"
+  },
+  "bugs": {
+    "url": "https://github.com/SessionSight/sdks/issues"
+  },
+  "keywords": [
+    "sessionsight",
+    "pii-redaction",
+    "stable-selectors"
+  ],
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "import": "./src/index.ts",
+      "types": "./src/index.ts"
+    },
+    "./integration-hint-verifier": {
+      "import": "./src/integration-hint-verifier.ts",
+      "types": "./src/integration-hint-verifier.ts"
+    }
+  },
+  "publishConfig": {
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+      ".": {
+        "import": "./dist/index.js",
+        "types": "./dist/index.d.ts"
+      },
+      "./integration-hint-verifier": {
+        "import": "./dist/integration-hint-verifier.js",
+        "types": "./dist/integration-hint-verifier.d.ts"
+      }
+    }
+  },
+  "scripts": {
+    "build": "bun build src/index.ts src/integration-hint-verifier.ts --outdir dist --format esm && bun x tsc --emitDeclarationOnly --declaration --outDir dist"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

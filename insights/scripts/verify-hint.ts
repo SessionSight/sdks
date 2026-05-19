@@ -6,7 +6,7 @@
  * structural drift (rename/removal of any referenced SDK export).
  */
 import { integrationHint } from '../src/integration-hint.js';
-import { verifyHint } from '@sessionsight/backend-shared/integration-hint-verifier';
+import { verifyHint } from '@sessionsight/sdk-shared/integration-hint-verifier';
 
 await verifyHint(integrationHint);
 // eslint-disable-next-line no-console

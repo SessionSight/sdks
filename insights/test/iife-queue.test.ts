@@ -42,8 +42,8 @@ interface QueueEntry {
 
 // Dynamic-imports of '../src/iife.js' evaluate the module's top-level code
 // exactly once (ES module caching). We therefore construct a single queue
-// covering every case — ordered + unordered replay, void + data-returning
-// methods, nested namespace, and a bogus path — and assert all outcomes
+// covering every case (ordered + unordered replay, void + data-returning
+// methods, nested namespace, and a bogus path) and assert all outcomes
 // from one replay pass.
 
 const resolved: Array<{ path: string[]; value: unknown }> = [];

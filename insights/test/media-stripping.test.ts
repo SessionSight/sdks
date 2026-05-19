@@ -83,7 +83,7 @@ function textNode(textContent: string) {
 
 // ── FullSnapshot: <img> ─────────────────────────────────────────────
 
-describe('scrubMediaInEvent — FullSnapshot <img>', () => {
+describe('scrubMediaInEvent:FullSnapshot <img>', () => {
   test('clears src+srcset and marks data-ss-blocked', () => {
     const ev = fullSnapshot(elNode(1, 'img', { src: 'https://cdn/x.png', srcset: 'https://a 1x, https://b 2x' }));
     const mirror = makeMirror({ 1: makeElement({ tagName: 'img' }) });
@@ -114,7 +114,7 @@ describe('scrubMediaInEvent — FullSnapshot <img>', () => {
     // Width/height attributes only come from intrinsic dims (so the
     // replay element's natural size matches the original media). When
     // intrinsic isn't available the rendered bounding rect is used as
-    // a backup signal — but only to pin the aspect-ratio inline,
+    // a backup signal, but only to pin the aspect-ratio inline,
     // because the bounding rect reflects post-CSS sizing rather than
     // the underlying media's natural size.
     const ev = fullSnapshot(elNode(1, 'img', { src: 'https://cdn/x.png' }));
@@ -128,7 +128,7 @@ describe('scrubMediaInEvent — FullSnapshot <img>', () => {
 
 // ── FullSnapshot: <video> + <audio> ─────────────────────────────────
 
-describe('scrubMediaInEvent — FullSnapshot <video>', () => {
+describe('scrubMediaInEvent:FullSnapshot <video>', () => {
   test('clears src + poster, marks blocked, preserves dims, pins aspect-ratio', () => {
     const ev = fullSnapshot(elNode(1, 'video', {
       src: 'https://cdn/v.mp4', poster: 'https://cdn/thumb.jpg', width: '640', height: '360',
@@ -160,7 +160,7 @@ describe('scrubMediaInEvent — FullSnapshot <video>', () => {
   });
 
   test('falls back to bounding rect for inline aspect-ratio when videoWidth is zero (metadata not loaded)', () => {
-    // See the parallel <img> case above — width/height attrs only come
+    // See the parallel <img> case above; width/height attrs only come
     // from intrinsic dims; bounding rect feeds the aspect-ratio pin.
     const ev = fullSnapshot(elNode(1, 'video', { src: 'https://cdn/v.mp4' }));
     const mirror = makeMirror({
@@ -201,7 +201,7 @@ describe('scrubMediaInEvent — FullSnapshot <video>', () => {
   });
 });
 
-describe('scrubMediaInEvent — FullSnapshot <audio>', () => {
+describe('scrubMediaInEvent:FullSnapshot <audio>', () => {
   test('clears src and marks blocked, no width/height added', () => {
     const ev = fullSnapshot(elNode(1, 'audio', { src: 'https://cdn/a.mp3' }));
     const mirror = makeMirror({ 1: makeElement({ tagName: 'audio' }) });
@@ -251,7 +251,7 @@ describe('scrubMediaInEvent — FullSnapshot <audio>', () => {
 // anyway, and they're commonly user-uploaded content). Should always
 // strip even with data-ss-allow on the element.
 
-describe('scrubMediaInEvent — blob: URLs', () => {
+describe('scrubMediaInEvent:blob: URLs', () => {
   test('clears <img src="blob:...">', () => {
     const ev = fullSnapshot(elNode(1, 'img', { src: 'blob:https://example.com/abc-123' }));
     const mirror = makeMirror({ 1: makeElement({ tagName: 'img' }) });
@@ -316,7 +316,7 @@ describe('scrubMediaInEvent — blob: URLs', () => {
 
 // ── Opt-in on <video> with all sources ──────────────────────────────
 
-describe('scrubMediaInEvent — <video> opt-in coverage', () => {
+describe('scrubMediaInEvent:<video> opt-in coverage', () => {
   test('opted-in <video> keeps URL src and poster', () => {
     const ev = fullSnapshot(elNode(1, 'video', {
       [SS_ALLOW_ATTR]: '',
@@ -335,7 +335,7 @@ describe('scrubMediaInEvent — <video> opt-in coverage', () => {
 
 // ── Absolutification of opt-in URLs ─────────────────────────────────
 
-describe('scrubMediaInEvent — opt-in URL absolutification', () => {
+describe('scrubMediaInEvent:opt-in URL absolutification', () => {
   test('relative src on opted-in <img> is absolutified against document.baseURI', () => {
     const ev = fullSnapshot(elNode(1, 'img', { [SS_ALLOW_ATTR]: '', src: '/test-image.png' }));
     const mirror = makeMirror({
@@ -394,7 +394,7 @@ describe('scrubMediaInEvent — opt-in URL absolutification', () => {
 
 // ── Inline style ────────────────────────────────────────────────────
 
-describe('scrubMediaInEvent — inline style', () => {
+describe('scrubMediaInEvent:inline style', () => {
   test('strips background-image url() but preserves other declarations', () => {
     const ev = fullSnapshot(elNode(1, 'div', {
       style: 'background-image: url(https://cdn/hero.jpg) no-repeat center; color: red',
@@ -446,7 +446,7 @@ describe('scrubMediaInEvent — inline style', () => {
     scrubMediaInEvent(ev, mirror);
     // CSS custom property '--my-url' is not in URL_BEARING_CSS_PROPERTIES,
     // so it survives. (Customers using --my-bg: url() for theme tokens
-    // would expect this — they declare the actual usage via
+    // would expect this; they declare the actual usage via
     // background-image: var(--my-bg), which strips at the usage site.)
     expect(ev.data.node.attributes.style).toContain('https://x.png');
     expect(ev.data.node.attributes[SS_BLOCKED_ATTR]).toBeUndefined();
@@ -488,7 +488,7 @@ describe('scrubMediaInEvent — inline style', () => {
 
 // ── Captured stylesheet text ────────────────────────────────────────
 
-describe('scrubMediaInEvent — _cssText on <style>', () => {
+describe('scrubMediaInEvent:_cssText on <style>', () => {
   test('strips url() references but preserves @font-face', () => {
     const css = `@font-face { src: url(/fonts/Inter.woff2) format('woff2'); }
 body { background-image: url(/img/bg.png); color: black; }
@@ -539,7 +539,7 @@ body { background-image: url(/img/bg.png); color: black; }
 
 // ── Mutations ───────────────────────────────────────────────────────
 
-describe('scrubMediaInEvent — Mutation source 0', () => {
+describe('scrubMediaInEvent:Mutation source 0', () => {
   test('scrubs adds[].node tree', () => {
     const ev: any = {
       type: 3,
@@ -609,7 +609,7 @@ describe('scrubMediaInEvent — Mutation source 0', () => {
 
 // ── source 8: StyleSheetRule ────────────────────────────────────────
 
-describe('scrubMediaInEvent — source 8 StyleSheetRule', () => {
+describe('scrubMediaInEvent:source 8 StyleSheetRule', () => {
   test('strips url() in adds[].rule but preserves @font-face', () => {
     const ev: any = {
       type: 3,
@@ -646,7 +646,7 @@ describe('scrubMediaInEvent — source 8 StyleSheetRule', () => {
 
 // ── source 13: StyleDeclaration ─────────────────────────────────────
 
-describe('scrubMediaInEvent — source 13 StyleDeclaration', () => {
+describe('scrubMediaInEvent:source 13 StyleDeclaration', () => {
   test('strips url() value when property is URL-bearing', () => {
     const ev: any = {
       type: 3, timestamp: 1,
@@ -705,7 +705,7 @@ describe('scrubMediaInEvent — source 13 StyleDeclaration', () => {
 
 // ── source 15: AdoptedStyleSheet ────────────────────────────────────
 
-describe('scrubMediaInEvent — source 15 AdoptedStyleSheet', () => {
+describe('scrubMediaInEvent:source 15 AdoptedStyleSheet', () => {
   test('strips background url() but preserves @font-face', () => {
     const ev: any = {
       type: 3, timestamp: 1,
@@ -749,7 +749,7 @@ describe('scrubMediaInEvent — source 15 AdoptedStyleSheet', () => {
 
 // ── <picture>, <source srcset>, SVG <image>, <use> ──────────────────
 
-describe('scrubMediaInEvent — picture, SVG image, use', () => {
+describe('scrubMediaInEvent:picture, SVG image, use', () => {
   test('<source srcset> inside <picture> is stripped', () => {
     const ev = fullSnapshot(elNode(1, 'picture', {}, [
       elNode(2, 'source', { srcset: 'https://a 1x' }),
@@ -806,7 +806,7 @@ describe('scrubMediaInEvent — picture, SVG image, use', () => {
 
 // ── Opt-in semantics ────────────────────────────────────────────────
 
-describe('scrubMediaInEvent — data-ss-allow opt-in', () => {
+describe('scrubMediaInEvent:data-ss-allow opt-in', () => {
   test('opt-in on element survives URL src, no marker', () => {
     const ev = fullSnapshot(elNode(1, 'img', { [SS_ALLOW_ATTR]: '', src: 'https://logo.png' }));
     const mirror = makeMirror({

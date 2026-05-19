@@ -1,5 +1,5 @@
 import SessionSightFeedback from './index.js';
-import type { IntegrationHint } from '@sessionsight/backend-shared/integration-hint-verifier';
+import type { IntegrationHint } from '@sessionsight/sdk-shared/integration-hint-verifier';
 
 /**
  * Server-side feedback SDK integration hint surfaced by the MCP server when

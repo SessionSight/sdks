@@ -12,7 +12,7 @@ const STRIPPED = SS_MEDIA_SHIM;
  *
  * These cover three concerns the unit tests can't:
  *
- * 1. Mirror readiness — the plan called out that scrubMedia is the first
+ * 1. Mirror readiness. The plan called out that scrubMedia is the first
  *    walker in this codebase to read live-DOM state from inside the rrweb
  *    emit callback by looking up the mirror. If rrweb populates the mirror
  *    AFTER dispatching emit, dimension capture and ancestor-opt-in walks
@@ -20,10 +20,10 @@ const STRIPPED = SS_MEDIA_SHIM;
  *    on a serialized node from inside emit and assert the live element
  *    comes back.
  *
- * 2. End-to-end — the Recorder→ingest→replay pipeline. We push events
+ * 2. End-to-end. The Recorder→ingest→replay pipeline. We push events
  *    through redactIngest server-side and confirm media is gone twice.
  *
- * 3. Real ancestor-walk semantics — the unit tests use a `closest` stub.
+ * 3. Real ancestor-walk semantics. The unit tests use a `closest` stub.
  *    These tests use real DOM trees so the inheritance walk is exercised
  *    against the actual `Element.closest` implementation.
  */
@@ -190,7 +190,7 @@ describe('e2e: record media-bearing DOM, push events through redactIngest', () =
     // ── Client-side scrub assertions (already applied via the recorder
     //    we wired into rrweb's emit). The recorder lives in our SDK and
     //    is tested above. Here we re-confirm by running scrubMediaInEvent
-    //    independently — we cannot rely on the Recorder class because we
+    //    independently; we cannot rely on the Recorder class because we
     //    aren't constructing one (we hooked record() directly). The point
     //    here is to prove the OUTPUT of the rrweb serialization shape
     //    (live mirror, real Element.closest, real naturalWidth=0) feeds
@@ -208,7 +208,7 @@ describe('e2e: record media-bearing DOM, push events through redactIngest', () =
 
     // jsdom normalizes URL attributes (adds a trailing slash for
     // bare-host URLs). Compare against a relaxed shape rather than a
-    // literal string match — what we care about is that the URL
+    // literal string match. What we care about is that the URL
     // survived in some form, not that it's byte-identical.
     expect(optedImg?.attributes?.src).toContain('logo.png');
     expect(optedImg?.attributes?.[SS_BLOCKED_ATTR]).toBeUndefined();
@@ -252,7 +252,8 @@ describe('e2e: record media-bearing DOM, push events through redactIngest', () =
       events: [fullSnap],
       metadata: {},
       userId: null,
-      userProperties: null,
+      email: null,
+      customProperties: null,
       geo: null,
       receivedAt: 1,
     });

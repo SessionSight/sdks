@@ -129,6 +129,31 @@ test('uses default apiUrl when not provided', async () => {
   expect(url).toBe('https://api.sessionsight.com/v1/feedback/submit');
 });
 
+test('BoundFeedbackClient does not overwrite an explicit empty-string sessionId from caller', async () => {
+  // Empty string is a *meaningful explicit override* (the caller is
+  // declaring "I have no session"). Falsy-coalescing it with the bound
+  // session would silently re-attach a session the caller wanted gone.
+  const mockFetch = mock(() =>
+    Promise.resolve(new Response(JSON.stringify({ success: true }), { status: 200 }))
+  );
+  globalThis.fetch = mockFetch;
+
+  const client = new FeedbackClient({
+    secretApiKey: 'sk_test_123',
+    propertyId: 'prop-1',
+  });
+  const bound = client.forRequest({
+    headers: { cookie: 'ss_sid=sess-from-cookie' },
+  });
+
+  const result = await bound.submit('bug-report', { sessionId: '' });
+  // Submit-level guard rejects empty sessionId; ensure that path runs
+  // (i.e. the bound session was NOT silently substituted in).
+  expect(result.success).toBe(false);
+  expect(result.error).toContain('sessionId is required');
+  expect(mockFetch.mock.calls.length).toBe(0);
+});
+
 test('submit only includes provided optional fields', async () => {
   const mockFetch = mock(() =>
     Promise.resolve(new Response(JSON.stringify({ success: true }), { status: 200 }))

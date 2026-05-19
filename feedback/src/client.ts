@@ -1,13 +1,5 @@
 import type { FeedbackConfig, FeedbackOptions, FeedbackResult } from './types.js';
-import { normalizeApiUrl, extractIdsFromRequest } from '@sessionsight/sdk-shared';
-
-const FETCH_TIMEOUT_MS = 10_000;
-
-function fetchWithTimeout(url: string, options: RequestInit): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer));
-}
+import { normalizeApiUrl, extractIdsFromRequest, fetchWithTimeout } from '@sessionsight/sdk-shared';
 
 export class FeedbackClient {
   private apiUrl: string;
@@ -22,7 +14,7 @@ export class FeedbackClient {
     if (!config.propertyId?.trim()) throw new Error('@sessionsight/feedback: propertyId is required.');
     this.secretApiKey = config.secretApiKey;
     this.propertyId = config.propertyId;
-    this.apiUrl = normalizeApiUrl(config.apiUrl || '');
+    this.apiUrl = normalizeApiUrl((config.apiUrl || '').trim());
   }
 
   async submit(feedbackTypeId: string, options?: FeedbackOptions): Promise<FeedbackResult> {
@@ -48,7 +40,9 @@ export class FeedbackClient {
 
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        return { success: false, error: (data as any).error || `HTTP ${res.status}` };
+        const error = (data as any).error || `HTTP ${res.status}`;
+        console.warn(`[SessionSight Feedback] Failed to submit feedback (status ${res.status}):`, error);
+        return { success: false, error };
       }
 
       return { success: true };
@@ -59,6 +53,7 @@ export class FeedbackClient {
     }
   }
 
+  // No persistent resources to release; method exists for API parity with stateful SDKs.
   destroy(): void {}
 
   /**
@@ -81,7 +76,7 @@ export class BoundFeedbackClient {
 
   submit(feedbackTypeId: string, options?: FeedbackOptions): Promise<FeedbackResult> {
     const merged: FeedbackOptions = { ...(options || {}) };
-    if (!merged.sessionId && this.bound.sessionId) merged.sessionId = this.bound.sessionId;
+    if (merged.sessionId === undefined && this.bound.sessionId) merged.sessionId = this.bound.sessionId;
     return this.client.submit(feedbackTypeId, merged);
   }
 }

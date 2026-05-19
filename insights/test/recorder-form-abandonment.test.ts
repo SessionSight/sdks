@@ -71,6 +71,10 @@ beforeEach(() => {
 
   (globalThis as any).crypto = {
     randomUUID: () => 'test-uuid',
+    // Recorder's per-session scramble cipher needs crypto.getRandomValues.
+    getRandomValues: (origCrypto && typeof origCrypto.getRandomValues === 'function')
+      ? (buf: any) => origCrypto.getRandomValues(buf)
+      : (buf: any) => { for (let i = 0; i < buf.length; i++) buf[i] = (i * 7 + 1) >>> 0; return buf; },
   };
 });
 
@@ -99,12 +103,14 @@ mock.module('../src/worker-bridge.js', () => ({
     postMetadata() {}
     postIdentify() {}
     flush() {}
+    flushAndDestroy() {}
     sendBeacon() {}
     destroy() {}
     onKilled() {}
     onPrivacy() {}
     onQuotaExceeded() {}
     onRotate() {}
+    onVisitorIdSwap() {}
   },
 }));
 
@@ -184,7 +190,7 @@ describe('form abandonment detection', () => {
 
     expect(abandonmentEvents()).toHaveLength(1);
     // page reflects the page the form was abandoned on (post-update),
-    // matching the recorder's emit timing — just verify it fires
+    // matching the recorder's emit timing; just verify it fires
     expect((rec as any).formActiveOnPage).toBe(false);
   });
 

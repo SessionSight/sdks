@@ -10,7 +10,7 @@ npm install @sessionsight/flags
 
 ## Documentation
 
-Install, configuration, and API reference: [sessionsight.com/docs/flags](https://sessionsight.com/docs/flags).
+Install, configuration, and API reference: [sessionsight.com/docs/build/sdks/flags-sdk/setup](https://sessionsight.com/docs/build/sdks/flags-sdk/setup).
 
 ## License
 

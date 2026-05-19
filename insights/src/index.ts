@@ -13,6 +13,13 @@ import {
   getStoredVisitorToken,
   clearVisitorToken,
   containsProhibitedPII,
+  isValidEmail,
+  MAX_ID_LEN,
+  MAX_EMAIL_LEN,
+  MAX_CUSTOM_KEY_LEN,
+  MAX_CUSTOM_VALUE_LEN,
+  MAX_CUSTOM_PROPERTY_COUNT,
+  RESERVED_CUSTOM_PROPERTY_KEYS,
   type GoalOptions,
   type GoalPayloadOptions,
   type GoalResult,
@@ -20,16 +27,138 @@ import {
 
 // ── Internal state ──────────────────────────────────────────────────
 
-function sanitizeProperties(
-  props: Record<string, string | number | boolean>,
-): Record<string, string | number | boolean> {
-  const out: Record<string, string | number | boolean> = {};
-  for (const [key, value] of Object.entries(props)) {
-    if (containsProhibitedPII(key)) continue;
-    if (typeof value === 'string' && containsProhibitedPII(value)) continue;
-    out[key] = value;
+/**
+ * Parsed and validated identify() payload. The SDK extracts `id` and
+ * `email` into dedicated wire fields and routes everything else through
+ * `customProperties` (after PII filtering and reserved-key checks).
+ *
+ * Per-call shape:
+ * - `id` / `email` are optional. An identify() call with neither slot is
+ *   valid (binds data to the current anonymous visitor).
+ * - PII in custom property values is silently dropped (drop-and-continue).
+ *   Everything else throws synchronously on violation so caller bugs
+ *   surface at the call site rather than producing silent ingest 400s.
+ */
+type ParsedIdentify = {
+  id?: string;
+  email?: string;
+  customProperties?: Record<string, string | number | boolean>;
+};
+
+function parseIdentifyPayload(
+  payload: Record<string, string | number | boolean | undefined>,
+): ParsedIdentify | null {
+  if (!payload || typeof payload !== 'object') {
+    throw new Error('SessionSight.identify: payload must be an object.');
   }
-  return out;
+
+  let id: string | undefined;
+  let email: string | undefined;
+  const customProperties: Record<string, string | number | boolean> = {};
+
+  // Walk the flat payload once; route each entry to the right slot.
+  for (const [rawKey, rawValue] of Object.entries(payload)) {
+    if (rawValue === undefined) continue;
+
+    if (rawKey === 'id') {
+      if (typeof rawValue !== 'string') {
+        throw new Error('SessionSight.identify: `id` must be a string.');
+      }
+      const trimmed = rawValue.trim();
+      if (trimmed.length === 0) {
+        throw new Error('SessionSight.identify: `id` must be a non-empty string.');
+      }
+      if (trimmed.length > MAX_ID_LEN) {
+        throw new Error(`SessionSight.identify: \`id\` exceeds ${MAX_ID_LEN} characters.`);
+      }
+      // PII check: the SDK's containsProhibitedPII calls redactString with
+      // skipEmail:true, so emails are NOT caught here. The email-shape
+      // rejection below is what keeps emails out of the `id` slot. If
+      // skipEmail is ever dropped, this rejection becomes redundant.
+      if (containsProhibitedPII(trimmed)) {
+        throw new Error(
+          'SessionSight.identify: `id` contains prohibited PII (SSN, credit card, credentials, or phone number).',
+        );
+      }
+      if (isValidEmail(trimmed)) {
+        throw new Error(
+          'SessionSight.identify: `id` must not be email-shaped. Use the `email` slot for email addresses.',
+        );
+      }
+      id = trimmed;
+      continue;
+    }
+
+    if (rawKey === 'email') {
+      if (typeof rawValue !== 'string') {
+        throw new Error('SessionSight.identify: `email` must be a string.');
+      }
+      const normalized = rawValue.trim().toLowerCase();
+      if (normalized.length === 0) {
+        throw new Error('SessionSight.identify: `email` must be a non-empty string.');
+      }
+      if (normalized.length > MAX_EMAIL_LEN) {
+        throw new Error(`SessionSight.identify: \`email\` exceeds ${MAX_EMAIL_LEN} characters.`);
+      }
+      if (!isValidEmail(normalized)) {
+        throw new Error('SessionSight.identify: `email` is not a valid email shape.');
+      }
+      email = normalized;
+      continue;
+    }
+
+    // Custom property branch.
+    if (RESERVED_CUSTOM_PROPERTY_KEYS.includes(rawKey as 'id' | 'email')) {
+      // Unreachable in practice: the SDK already extracted `id`/`email`
+      // above. Defensive in case the list grows without updating the
+      // routing above.
+      throw new Error(`SessionSight.identify: \`${rawKey}\` is reserved.`);
+    }
+    if (typeof rawKey !== 'string' || rawKey.length === 0) {
+      throw new Error('SessionSight.identify: custom property keys must be non-empty strings.');
+    }
+    if (rawKey.length > MAX_CUSTOM_KEY_LEN) {
+      throw new Error(
+        `SessionSight.identify: custom property key \`${rawKey}\` exceeds ${MAX_CUSTOM_KEY_LEN} characters.`,
+      );
+    }
+    // Per-key PII silently drops by design. Structural errors (missing key,
+    // length cap) surface to the caller; PII detection does not.
+    if (containsProhibitedPII(rawKey)) continue;
+
+    if (typeof rawValue === 'string') {
+      if (rawValue.length > MAX_CUSTOM_VALUE_LEN) {
+        throw new Error(
+          `SessionSight.identify: custom property value for \`${rawKey}\` exceeds ${MAX_CUSTOM_VALUE_LEN} characters.`,
+        );
+      }
+      // Per-value PII silently drops.
+      if (containsProhibitedPII(rawValue)) continue;
+      customProperties[rawKey] = rawValue;
+    } else if (typeof rawValue === 'number' || typeof rawValue === 'boolean') {
+      customProperties[rawKey] = rawValue;
+    } else {
+      throw new Error(
+        `SessionSight.identify: custom property value for \`${rawKey}\` must be string, number, or boolean.`,
+      );
+    }
+  }
+
+  const propCount = Object.keys(customProperties).length;
+  if (propCount > MAX_CUSTOM_PROPERTY_COUNT) {
+    throw new Error(
+      `SessionSight.identify: at most ${MAX_CUSTOM_PROPERTY_COUNT} custom properties allowed.`,
+    );
+  }
+
+  // Empty-object no-op: neither slot present, no surviving properties.
+  if (!id && !email && propCount === 0) return null;
+
+  const parsed: ParsedIdentify = {};
+  if (id) parsed.id = id;
+  if (email) parsed.email = email;
+  if (propCount > 0) parsed.customProperties = customProperties;
+  return parsed;
 }
 
 const PRIVACY_CACHE_KEY = 'sessionsight_privacy_config';
@@ -49,7 +178,7 @@ let lastPrivacyConfig: PrivacyConfig = { privacyMode: 'default', excludePages: [
 
 /** Stored config for recreating the recorder after visibility-based or idle session end. */
 let lastInitConfig: { bridge: WorkerBridge; propertyId: string; autoRecord: boolean } | null = null;
-/** Base connection config (apiUrl, apiKey, propertyId, autoRecord) — retained across withdrawal so setConsent(true) can open a fresh bridge without reinit. */
+/** Base connection config (apiUrl, apiKey, propertyId, autoRecord). Retained across withdrawal so setConsent(true) can open a fresh bridge without reinit. */
 let connectionConfig: { apiUrl: string; apiKey: string; propertyId: string; autoRecord: boolean } | null = null;
 let storedVisitorId: string = '';
 let storedSessionId: string = '';
@@ -251,6 +380,12 @@ function rotateSession(): void {
 
   newBridge.onRotate(() => { rotateSession(); });
 
+  newBridge.onVisitorIdSwap((newVisitorId) => {
+    storedVisitorId = newVisitorId;
+  });
+
+  newBridge.onKilled(handleBridgeKilled);
+
   lastInitConfig = { bridge: newBridge, propertyId, autoRecord };
   pendingConfig = { bridge: newBridge, propertyId, autoRecord };
   awaitingRotateResurrection = wasRecording;
@@ -263,6 +398,30 @@ function handleFocusCookieWrite(): void {
 }
 
 // ── Consent grant / withdrawal ───────────────────────────────────────
+
+/**
+ * Module-level cleanup when the bridge reports `killed` (invalid API key,
+ * subscription required). Recorder's own onKilled handler tears down its
+ * rrweb capture; this clears the SDK-level state so the SDK reads as
+ * "uninitialized" again and stops polling for consent. Bridge already
+ * marked itself killed; no need to call destroy().
+ */
+function handleBridgeKilled(): void {
+  if (recorder) {
+    try { recorder.stop(); } catch {}
+    recorder = null;
+  }
+  pendingConfig = null;
+  lastInitConfig = null;
+  connectionConfig = null;
+  goalsConfig = null;
+  storedSessionId = '';
+  storedVisitorId = '';
+  awaitingRotateResurrection = false;
+  stopPolling();
+  consentGetter = null;
+  lastConsentValue = null;
+}
 
 /**
  * Wire up a new session: mint visitorId (read-or-mint from storage),
@@ -305,6 +464,12 @@ function applyConsentGranted(): void {
   });
 
   bridge.onRotate(() => { rotateSession(); });
+
+  bridge.onVisitorIdSwap((newVisitorId) => {
+    storedVisitorId = newVisitorId;
+  });
+
+  bridge.onKilled(handleBridgeKilled);
 
   lastInitConfig = { bridge, propertyId, autoRecord };
 
@@ -486,7 +651,7 @@ const SessionSight = {
           // 'denied' is the no-session state; nothing to do.
           return;
         }
-        // No CMv2 signal present — fall through to the `consent` init param.
+        // No CMv2 signal present; fall through to the `consent` init param.
       }
 
       if (typeof consentOption === 'function') {
@@ -565,24 +730,49 @@ const SessionSight = {
   },
 
   /**
-   * Write identity onto the current session. No-op in the no-session
-   * state (consent withdrawn): identity is meaningless without a session
-   * to attach it to. Callers must re-call identify() after a consent
-   * re-grant (which opens a new session).
+   * Bind identity and/or custom data to the current visitor.
+   *
+   * Accepts a flat object:
+   *
+   *   SessionSight.identify({
+   *     id?: string,       // opaque stable identifier (your internal user id)
+   *     email?: string,    // canonical email slot (normalized to lowercase + trim)
+   *     ...customProperties,
+   *   });
+   *
+   * Both `id` and `email` are optional. An empty `{}` is a no-op. A call
+   * with only custom properties (no `id`, no `email`) binds data to the
+   * current anonymous visitor without claiming an identity.
+   *
+   * Throws synchronously on validation failure:
+   *  - email-shaped value passed as `id`
+   *  - PII (SSN/cc/credentials/phone) in `id`
+   *  - invalid email shape, or oversized id/email
+   *  - reserved-key collision in custom properties
+   *  - oversized custom property key/value, or more than the allowed cap
+   *  - wrong type (custom properties must be string/number/boolean)
+   *
+   * Silently drops, per the existing per-value PII rule:
+   *  - custom property keys matching the PII regex
+   *  - string-typed custom property values matching the PII regex
+   *
+   * No-op in the no-session state (consent withdrawn): identity is
+   * meaningless without a session to attach it to. Callers must re-call
+   * identify() after a consent re-grant (which opens a new session).
    */
-  identify(stableId: string, properties?: Record<string, string | number | boolean>): void {
-    if (containsProhibitedPII(stableId)) {
-      throw new Error(
-        'SessionSight.identify: stableId contains prohibited PII (SSN, credit card, credentials, or phone number). Use an email, UUID, or other non-PII identifier.',
-      );
-    }
-    const sanitized = properties ? sanitizeProperties(properties) : undefined;
-    if (recorder) recorder.identify(stableId, sanitized);
+  identify(payload: { id?: string; email?: string } & Record<string, string | number | boolean | undefined>): void {
+    const parsed = parseIdentifyPayload(payload);
+    if (!parsed) return; // empty / all-dropped → no network call
+    if (recorder) recorder.identify(parsed);
   },
 
   /** Returns the current session's visitorId, or null in the no-session state. */
   getVisitorId(): string | null {
-    return recorder ? recorder.getVisitorId() : null;
+    // Prefer the recorder's id (it tracks bootstrap-recovery swaps via the
+    // bridge's onVisitorIdSwap callback), but fall through to storedVisitorId
+    // when no recorder is attached (rotateSession() pending-config phase) or
+    // the recorder doesn't have a value yet.
+    return (recorder?.getVisitorId() || storedVisitorId) || null;
   },
 };
 

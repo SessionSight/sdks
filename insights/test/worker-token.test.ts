@@ -3,7 +3,7 @@ import { test, expect, describe, beforeAll, beforeEach, afterAll } from 'bun:tes
 /**
  * Direct tests for `packages/insights/src/worker.ts`.
  *
- * Until now the worker had ZERO test coverage — it's bundled into a
+ * Until now the worker had ZERO test coverage; it's bundled into a
  * string and only exercised end-to-end in a real browser. That made it
  * the hiding place for silent bugs like "any 401 kills the transport"
  * and "never reads rotateVisitorToken from HTTP responses".
@@ -171,7 +171,7 @@ describe('worker WS close 4004 surfaces visitor_token_rejected', () => {
     expect(rejections).toHaveLength(1);
     expect(rejections[0].code).toBe('visitor_token_required');
 
-    // Did NOT post 'killed' — recoverable.
+    // Did NOT post 'killed'; recoverable.
     expect(postedOfType('killed')).toHaveLength(0);
   });
 
@@ -250,15 +250,16 @@ describe('worker HTTP token rejection requeues events, never kills', () => {
     // Worker posted a rejection and did NOT ack the events.
     expect(postedOfType('visitor_token_rejected').some(m => m.code === 'VISITOR_TOKEN_REQUIRED')).toBe(true);
     expect(postedOfType('ack').some(m => m.seq === 101)).toBe(false);
-    // Transport is alive — no `killed` message.
+    // Transport is alive; no `killed` message.
     expect(postedOfType('killed')).toHaveLength(0);
 
     // Simulate the main thread pushing a fresh token. The worker's
-    // handler reconnects WS and flushes the requeued buffer, which is
-    // where the second HTTP call comes from (WS not ready yet).
+    // handler reconnects WS and (after a short deadline so the WS
+    // `ready` path can win) flushes the requeued buffer via HTTP, which
+    // is where the second HTTP call comes from.
     postedMessages = []; // ignore earlier messages
     sendToWorker({ type: 'set_visitor_token', visitorToken: VALID_TOKEN_A });
-    await new Promise((r) => setTimeout(r, 10));
+    await new Promise((r) => setTimeout(r, 200));
 
     expect(ingestCalls).toBe(2);
     expect(secondBody.visitorToken).toBe(VALID_TOKEN_A);
@@ -290,10 +291,13 @@ describe('worker HTTP token rejection requeues events, never kills', () => {
     expect(postedOfType('visitor_token_rejected').some(m => m.code === 'VISITOR_TOKEN_INVALID')).toBe(true);
     expect(postedOfType('killed')).toHaveLength(0);
 
-    // After a fresh token, events should reach the server.
+    // After a fresh token, events should reach the server. The worker's
+    // post-recovery flush is now deferred 100ms so a successful WS handshake
+    // can win over the HTTP fallback; in this test the WS connect is mocked
+    // out, so the HTTP fallback path takes over after the deadline.
     postedMessages = [];
     sendToWorker({ type: 'set_visitor_token', visitorToken: VALID_TOKEN_B });
-    await new Promise((r) => setTimeout(r, 10));
+    await new Promise((r) => setTimeout(r, 200));
     expect(ingestCalls).toBe(2);
   });
 
