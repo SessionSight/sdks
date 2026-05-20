@@ -312,15 +312,24 @@ describe('WorkerBridge handles visitor_token_rejected', () => {
 
     expect(bootstrapCalls).toBe(1);
 
-    // Finish the first bootstrap and let a fresh rejection trigger a new
-    // bootstrap, proving the dedupe releases after completion.
+    // Finish the first bootstrap. A second rejection that arrives WITHIN
+    // the post-recovery cooldown (1.5s) is intentionally swallowed: those
+    // are typically rejections from in-flight requests that started
+    // before the fresh token was minted. See the cooldown comment in
+    // WorkerBridge.handleVisitorTokenRejection.
     resolveBootstrap!(new Response(JSON.stringify({
       visitorId: OLD_ID, visitorToken: VALID_TOKEN, issuedAt: Date.now(),
     }), { status: 200 }));
     await new Promise((r) => setTimeout(r, 10));
-
     fake.emit({ type: 'visitor_token_rejected', code: 'VISITOR_TOKEN_REQUIRED' });
-    // Keep the second bootstrap pending.
+    await new Promise((r) => setTimeout(r, 5));
+    expect(bootstrapCalls).toBe(1);
+
+    // Past the cooldown window, a fresh rejection triggers a second
+    // bootstrap. (Tests need real wall-clock waits here because the
+    // bridge reads Date.now() directly.)
+    await new Promise((r) => setTimeout(r, 1_600));
+    fake.emit({ type: 'visitor_token_rejected', code: 'VISITOR_TOKEN_REQUIRED' });
     await new Promise((r) => setTimeout(r, 5));
     expect(bootstrapCalls).toBe(2);
     bridge.destroy();

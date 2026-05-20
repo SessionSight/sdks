@@ -656,6 +656,24 @@ export function buildGoalPayload(
   };
 }
 
+// ── Device classification ───────────────────────────────────────────
+
+/**
+ * Classify a User-Agent + viewport width as mobile / tablet / desktop. Used
+ * by the SDK's anonymous-tier capture to attach a `deviceClass` to each
+ * pageview without persisting the raw UA. The full-tier server-side
+ * classifier (apps/api/src/utils/classifyDevice.ts) mirrors this logic so
+ * client and server agree on the bucket for a given visitor.
+ */
+export type DeviceClass = 'mobile' | 'tablet' | 'desktop';
+
+export function classifyDevice(userAgent: string, screenWidth: number): DeviceClass {
+  const ua = userAgent?.toLowerCase() || '';
+  if (/tablet|ipad/i.test(ua)) return 'tablet';
+  if (/mobile|android|iphone|ipod/i.test(ua) || (screenWidth > 0 && screenWidth < 768)) return 'mobile';
+  return 'desktop';
+}
+
 // ── HTTP helpers ────────────────────────────────────────────────────
 
 /**

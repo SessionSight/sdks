@@ -38,24 +38,17 @@ interface PrivacyConfig {
   excludePages: string[];
 }
 
+import {
+  MAX_KEEPALIVE_BYTES,
+  MAX_RECONNECT_DELAY,
+  secureJitter,
+  chunkEvents,
+} from './_transport-shared.js';
+
 // ── Configuration ────────────────────────────────────────────────
 
 const FLUSH_INTERVAL_MS = 6_000;
-
-/**
- * Crypto-backed [0, max) float for reconnect jitter. Math.random is banned
- * across this package so a grep for it stays empty (see C1 fallback removal).
- */
-function secureJitter(max: number): number {
-  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-    const buf = new Uint32Array(1);
-    crypto.getRandomValues(buf);
-    return (buf[0]! / 0x1_0000_0000) * max;
-  }
-  return 0;
-}
 const FLUSH_EVENT_THRESHOLD = 50;
-const MAX_KEEPALIVE_BYTES = 60_000;
 
 // ── Worker state ─────────────────────────────────────────────────
 
@@ -113,7 +106,6 @@ let ws: WebSocket | null = null;
 let wsReady = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectDelay = 1_000;
-const MAX_RECONNECT_DELAY = 30_000;
 let closed = false;
 
 function connectWs(): void {
@@ -397,33 +389,6 @@ async function sendHttpAsync(
   if (!anyFailed) {
     self.postMessage({ type: 'ack', seq: seqEnd });
   }
-}
-
-function chunkEvents(payload: IngestPayload): IngestPayload[] {
-  const { events, ...rest } = payload;
-  if (events.length === 0) return [payload];
-
-  const envelopeSize = JSON.stringify({ ...rest, events: [] }).length;
-  const chunks: IngestPayload[] = [];
-  let currentEvents: any[] = [];
-  let currentSize = envelopeSize;
-
-  for (const event of events) {
-    const eventSize = JSON.stringify(event).length + 1;
-    if (currentEvents.length > 0 && currentSize + eventSize > MAX_KEEPALIVE_BYTES) {
-      chunks.push({ ...rest, events: currentEvents });
-      currentEvents = [];
-      currentSize = envelopeSize;
-    }
-    currentEvents.push(event);
-    currentSize += eventSize;
-  }
-
-  if (currentEvents.length > 0) {
-    chunks.push({ ...rest, events: currentEvents });
-  }
-
-  return chunks;
 }
 
 // ── Message handler ──────────────────────────────────────────────

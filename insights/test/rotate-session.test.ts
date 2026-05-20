@@ -155,6 +155,30 @@ mock.module('../src/worker-bridge.js', () => ({
   },
 }));
 
+// ── Mock anonymous-tier transports so consent transitions don't ─────
+// ── try to spin up real workers in the test environment. ─────────────
+
+mock.module('../src/anonymous-worker-bridge.js', () => ({
+  AnonymousWorkerBridge: class {
+    constructor(_opts: any) {}
+    onKilled(_cb: Function) {}
+    postEvent() {}
+    flush() {}
+    flushAndDestroy() {}
+    destroy() {}
+  },
+}));
+
+mock.module('../src/anonymous-capture.js', () => ({
+  AnonymousCapture: class {
+    constructor(_opts: any) {}
+    start() {}
+    stop() {}
+    applyPrivacyConfig() {}
+    emitGoalCount() {}
+  },
+}));
+
 // ── Mock Recorder with start/stop tracking ───────────────────────────
 
 interface RecorderStub {

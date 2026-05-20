@@ -19,9 +19,10 @@ import {
   writeVisitorId,
 } from '@sessionsight/sdk-shared';
 
+import { MAX_KEEPALIVE_BYTES } from './_transport-shared';
+
 const FLUSH_INTERVAL_MS = 6_000;
 const FLUSH_EVENT_THRESHOLD = 50;
-const MAX_KEEPALIVE_BYTES = 60_000;
 
 export class WorkerBridge {
   private worker: Worker | null = null;
@@ -346,16 +347,6 @@ export class WorkerBridge {
     return this._killed;
   }
 
-  /**
-   * Re-arm a previously-killed bridge so the next event flow doesn't drop.
-   * The worker resets its own `killed` flag on `init`; bridges are normally
-   * constructed fresh per session so this rarely matters, but keep the
-   * symmetry available for tests and any future re-init flow.
-   */
-  resetKilled(): void {
-    this._killed = false;
-  }
-
   destroy(): void {
     if (this.worker) {
       try { this.worker.terminate(); } catch {}
@@ -445,11 +436,25 @@ export class WorkerBridge {
   // subsequent payload carries the new id + matching token.
 
   private tokenRecoveryInFlight: Promise<void> | null = null;
+  /** Timestamp of the last completed bootstrap recovery. */
+  private lastRecoveryAt = 0;
+  /**
+   * Cooldown after a successful recovery. Requests that were in flight when
+   * the old token expired will return 401 a short while later; without this
+   * guard each one would trigger another bootstrap with the freshly-minted
+   * visitorId as the clientVisitorId, and the server (correctly seeing that
+   * id as already claimed) would mint yet another fresh UUID. Net result:
+   * a cascade of bootstraps each producing a different visitorId, visible
+   * in dev tools as multiple bootstrap requests with different return ids.
+   */
+  private static readonly RECOVERY_COOLDOWN_MS = 1_500;
 
   private handleVisitorTokenRejection(): void {
     if (this.tokenRecoveryInFlight) return;
+    if (Date.now() - this.lastRecoveryAt < WorkerBridge.RECOVERY_COOLDOWN_MS) return;
     clearVisitorToken();
     this.tokenRecoveryInFlight = this.recoverVisitorToken().finally(() => {
+      this.lastRecoveryAt = Date.now();
       this.tokenRecoveryInFlight = null;
     });
   }

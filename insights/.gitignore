@@ -1,2 +1,3 @@
 dist/
 src/_worker-bundle.ts
+src/_anonymous-worker-bundle.ts

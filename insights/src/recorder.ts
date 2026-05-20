@@ -1612,14 +1612,6 @@ export class Recorder {
     return this.visitorId;
   }
 
-  getBridge(): WorkerBridge {
-    return this.bridge;
-  }
-
-  getPropertyId(): string {
-    return this.propertyId;
-  }
-
   /**
    * Detect changes to the identity slots and forward the parsed payload
    * to the WorkerBridge. Also emit a `set_user_properties` custom event

@@ -1,6 +1,8 @@
 import { Recorder } from './recorder.js';
 import { WorkerBridge } from './worker-bridge.js';
-import type { SessionSightConfig, RecordOptions, PrivacyConfig } from './types.js';
+import { AnonymousCapture } from './anonymous-capture.js';
+import { AnonymousWorkerBridge } from './anonymous-worker-bridge.js';
+import type { SessionSightConfig, RecordOptions, PrivacyConfig, ConsentLevel } from './types.js';
 import {
   normalizeApiUrl,
   getOrCreateVisitorId,
@@ -14,6 +16,8 @@ import {
   clearVisitorToken,
   containsProhibitedPII,
   isValidEmail,
+  shouldSuppressPersistentId,
+  hasLocalStorage,
   MAX_ID_LEN,
   MAX_EMAIL_LEN,
   MAX_CUSTOM_KEY_LEN,
@@ -27,18 +31,6 @@ import {
 
 // ── Internal state ──────────────────────────────────────────────────
 
-/**
- * Parsed and validated identify() payload. The SDK extracts `id` and
- * `email` into dedicated wire fields and routes everything else through
- * `customProperties` (after PII filtering and reserved-key checks).
- *
- * Per-call shape:
- * - `id` / `email` are optional. An identify() call with neither slot is
- *   valid (binds data to the current anonymous visitor).
- * - PII in custom property values is silently dropped (drop-and-continue).
- *   Everything else throws synchronously on violation so caller bugs
- *   surface at the call site rather than producing silent ingest 400s.
- */
 type ParsedIdentify = {
   id?: string;
   email?: string;
@@ -56,7 +48,6 @@ function parseIdentifyPayload(
   let email: string | undefined;
   const customProperties: Record<string, string | number | boolean> = {};
 
-  // Walk the flat payload once; route each entry to the right slot.
   for (const [rawKey, rawValue] of Object.entries(payload)) {
     if (rawValue === undefined) continue;
 
@@ -71,10 +62,6 @@ function parseIdentifyPayload(
       if (trimmed.length > MAX_ID_LEN) {
         throw new Error(`SessionSight.identify: \`id\` exceeds ${MAX_ID_LEN} characters.`);
       }
-      // PII check: the SDK's containsProhibitedPII calls redactString with
-      // skipEmail:true, so emails are NOT caught here. The email-shape
-      // rejection below is what keeps emails out of the `id` slot. If
-      // skipEmail is ever dropped, this rejection becomes redundant.
       if (containsProhibitedPII(trimmed)) {
         throw new Error(
           'SessionSight.identify: `id` contains prohibited PII (SSN, credit card, credentials, or phone number).',
@@ -107,11 +94,7 @@ function parseIdentifyPayload(
       continue;
     }
 
-    // Custom property branch.
     if (RESERVED_CUSTOM_PROPERTY_KEYS.includes(rawKey as 'id' | 'email')) {
-      // Unreachable in practice: the SDK already extracted `id`/`email`
-      // above. Defensive in case the list grows without updating the
-      // routing above.
       throw new Error(`SessionSight.identify: \`${rawKey}\` is reserved.`);
     }
     if (typeof rawKey !== 'string' || rawKey.length === 0) {
@@ -122,8 +105,6 @@ function parseIdentifyPayload(
         `SessionSight.identify: custom property key \`${rawKey}\` exceeds ${MAX_CUSTOM_KEY_LEN} characters.`,
       );
     }
-    // Per-key PII silently drops by design. Structural errors (missing key,
-    // length cap) surface to the caller; PII detection does not.
     if (containsProhibitedPII(rawKey)) continue;
 
     if (typeof rawValue === 'string') {
@@ -132,7 +113,6 @@ function parseIdentifyPayload(
           `SessionSight.identify: custom property value for \`${rawKey}\` exceeds ${MAX_CUSTOM_VALUE_LEN} characters.`,
         );
       }
-      // Per-value PII silently drops.
       if (containsProhibitedPII(rawValue)) continue;
       customProperties[rawKey] = rawValue;
     } else if (typeof rawValue === 'number' || typeof rawValue === 'boolean') {
@@ -151,7 +131,6 @@ function parseIdentifyPayload(
     );
   }
 
-  // Empty-object no-op: neither slot present, no surviving properties.
   if (!id && !email && propCount === 0) return null;
 
   const parsed: ParsedIdentify = {};
@@ -163,11 +142,10 @@ function parseIdentifyPayload(
 
 const PRIVACY_CACHE_KEY = 'sessionsight_privacy_config';
 
+// ── Full-tier state ──────────────────────────────────────────────────
+
 let recorder: Recorder | null = null;
 let pendingConfig: { bridge: WorkerBridge; propertyId: string; autoRecord: boolean } | null = null;
-let consentGetter: (() => boolean) | null = null;
-let consentPollTimer: ReturnType<typeof setInterval> | null = null;
-let lastConsentValue: boolean | null = null;
 let visibilityResurrectionListener: (() => void) | null = null;
 let idleResurrectionListener: (() => void) | null = null;
 let focusCookieListener: (() => void) | null = null;
@@ -175,26 +153,47 @@ let focusCookieListener: (() => void) | null = null;
 let awaitingRotateResurrection = false;
 /** The last privacy config received from the server, used for session resurrection. */
 let lastPrivacyConfig: PrivacyConfig = { privacyMode: 'default', excludePages: [] };
-
-/** Stored config for recreating the recorder after visibility-based or idle session end. */
 let lastInitConfig: { bridge: WorkerBridge; propertyId: string; autoRecord: boolean } | null = null;
-/** Base connection config (apiUrl, apiKey, propertyId, autoRecord). Retained across withdrawal so setConsent(true) can open a fresh bridge without reinit. */
 let connectionConfig: { apiUrl: string; apiKey: string; propertyId: string; autoRecord: boolean } | null = null;
 let storedVisitorId: string = '';
 let storedSessionId: string = '';
-/** Config used by goals.increment/decrement. Set during init(), cleared on setConsent(false). */
 let goalsConfig: { apiUrl: string; apiKey: string; propertyId: string } | null = null;
 let quotaExceeded = false;
 
+// ── Tier state (consent level + anonymous bridge) ────────────────────
+
+/** Current active tier. Determines which capture path is alive. */
+let activeTier: ConsentLevel = 'anonymous';
+/** Bridge for the anonymous tier. Mutually exclusive with `recorder`. */
+let anonymousBridge: AnonymousWorkerBridge | null = null;
+/** AnonymousCapture instance. Mutually exclusive with `recorder`. */
+let anonymousCapture: AnonymousCapture | null = null;
+/** Ephemeral per-tab tokens used by the anonymous tier. Memory-only. */
+let ephemeralVisitorId: string = '';
+let ephemeralSessionId: string = '';
+
+// ── Consent polling ──────────────────────────────────────────────────
+
+let consentGetter: (() => ConsentLevel) | null = null;
+let consentPollTimer: ReturnType<typeof setInterval> | null = null;
+let lastConsentLevel: ConsentLevel | null = null;
+
 // ── CMv2 opt-in state ────────────────────────────────────────────────
 
-/** Whether honorConsentMode was enabled at init. */
 let cmv2Enabled = false;
-/** True after an explicit setConsent() call; CMv2 updates are ignored until followConsentMode() re-arms. */
 let cmv2ExplicitOverride = false;
-/** Installed gtag patch reference so we can restore on teardown. */
 let originalGtag: any = null;
 let cmv2PatchInstalled = false;
+
+/**
+ * Coerce a legacy boolean or current `ConsentLevel` value into a
+ * `ConsentLevel`. `true` → 'full', `false` → 'anonymous'. There is no
+ * separate "off" state.
+ */
+function coerceLevel(v: ConsentLevel | boolean): ConsentLevel {
+  if (typeof v === 'boolean') return v ? 'full' : 'anonymous';
+  return v === 'full' ? 'full' : 'anonymous';
+}
 
 // ── Goal fires ───────────────────────────────────────────────────────
 
@@ -208,9 +207,15 @@ function fireGoal(action: 'increment' | 'decrement', goalId: string, options?: G
   const amtErr = validateGoalAmount(amount);
   if (amtErr) return { success: false, error: amtErr };
 
-  // In the no-session state (consent withdrawn), silently no-op. Goals
-  // are session-scoped conversions; without a session the ingest API
-  // would refuse the write anyway.
+  // Anonymous tier: route to the aggregate transport. No `amount` because
+  // the anonymous tier cannot attribute dollars to a person; decrement is
+  // a no-op for the same reason (counters don't move negative).
+  if (activeTier === 'anonymous') {
+    if (action === 'decrement') return { success: false, error: 'decrement not supported in anonymous tier' };
+    if (anonymousCapture) anonymousCapture.emitGoalCount(goalId);
+    return { success: true };
+  }
+
   const sessionIdForFire = options?.sessionId || storedSessionId;
   if (!sessionIdForFire) return { success: false, error: 'no session (consent required)' };
 
@@ -260,16 +265,18 @@ function cachePrivacyConfig(propertyId: string, config: PrivacyConfig): void {
   } catch {}
 }
 
-// ── Consent polling (getter form) ────────────────────────────────────
+// ── Consent polling ──────────────────────────────────────────────────
 
 function pollConsent(): void {
   if (!consentGetter) return;
-  const current = consentGetter();
-  if (current === lastConsentValue) return;
-  lastConsentValue = current;
-
-  if (current) applyConsentGranted();
-  else applyConsentWithdrawn();
+  const desired = consentGetter();
+  // GPC/DNT pins the level to anonymous, regardless of what the getter
+  // returned. A user who set GPC and explicitly clicked Accept still gets
+  // anonymous-tier capture — lines up with the spirit of GPC's "don't
+  // profile" signal.
+  const target: ConsentLevel = shouldSuppressPersistentId() ? 'anonymous' : desired;
+  if (target === lastConsentLevel) return;
+  applyTierTransition(target);
 }
 
 function startPolling(): void {
@@ -284,13 +291,47 @@ function stopPolling(): void {
   }
 }
 
+/**
+ * Move from whatever tier is currently active to `target`. Idempotent:
+ * calling with the active tier is a no-op.
+ *
+ *   anonymous → full:  tear down anonymous transport, run applyConsentGranted().
+ *   full → anonymous:  flush + tear down the full-tier session (clearing
+ *                      ss_vid + ss_vtoken + ss_sid + sessionsight_visitor_id),
+ *                      then spin up the anonymous transport.
+ *
+ * The visitor-id clear on full → anonymous is a deliberate behaviour change
+ * from older versions of the SDK: leaving ss_vid set while the anonymous
+ * tier is running would violate the tier's zero-persistent-storage rule.
+ * Operator-visible consequence: a visitor who waffles (Accept → Decline →
+ * Accept) shows as two distinct identified visitors. The trade favours
+ * strict anonymous-tier privacy.
+ *
+ * Only the OUTGOING tier is torn down. On initial setup (lastConsentLevel
+ * is null) we skip teardown entirely — calling teardownFull() here would
+ * wipe a returning visitor's ss_vid/ss_vtoken cookies even though no
+ * full-tier session ever existed in this page lifetime, forcing the next
+ * Accept into a needless 401 → bootstrap → re-mint cycle.
+ */
+function applyTierTransition(target: ConsentLevel): void {
+  if (target === lastConsentLevel) return;
+
+  if (lastConsentLevel === 'full') teardownFull();
+  else if (lastConsentLevel === 'anonymous') teardownAnonymous();
+
+  if (target === 'full') applyConsentGranted();
+  else applyAnonymousActive();
+
+  activeTier = target;
+  lastConsentLevel = target;
+}
+
 // ── Visibility / idle resurrection ───────────────────────────────────
 
 function handleVisibilityResurrection(): void {
   if (document.visibilityState !== 'visible') return;
   if (!lastInitConfig) return;
-
-  if (consentGetter && !consentGetter()) return;
+  if (activeTier !== 'full') return;
 
   if (awaitingRotateResurrection && pendingConfig) {
     awaitingRotateResurrection = false;
@@ -310,8 +351,7 @@ function handleVisibilityResurrection(): void {
 
 function handleIdleResurrection(): void {
   if (!lastInitConfig) return;
-
-  if (consentGetter && !consentGetter()) return;
+  if (activeTier !== 'full') return;
 
   if (awaitingRotateResurrection && pendingConfig) {
     awaitingRotateResurrection = false;
@@ -329,10 +369,6 @@ function handleIdleResurrection(): void {
   recorder.start(autoRecord);
 }
 
-/**
- * Server-driven session rotation. Invoked when the backend signals that the
- * current sessionId has been sealed (analytics computed, archival pending).
- */
 function rotateSession(): void {
   if (!goalsConfig || !lastInitConfig) return;
 
@@ -363,6 +399,7 @@ function rotateSession(): void {
     lastPrivacyConfig = serverConfig;
     cachePrivacyConfig(propertyId, serverConfig);
     if (recorder) recorder.applyPrivacyConfig(serverConfig);
+    if (anonymousCapture) anonymousCapture.applyPrivacyConfig(serverConfig);
   });
 
   newBridge.onQuotaExceeded(() => {
@@ -393,19 +430,13 @@ function rotateSession(): void {
 
 function handleFocusCookieWrite(): void {
   if (!storedSessionId) return;
+  if (activeTier !== 'full') return;
   if (document.visibilityState && document.visibilityState !== 'visible') return;
   writeSessionCookie(storedSessionId);
 }
 
-// ── Consent grant / withdrawal ───────────────────────────────────────
+// ── Full-tier setup / teardown ───────────────────────────────────────
 
-/**
- * Module-level cleanup when the bridge reports `killed` (invalid API key,
- * subscription required). Recorder's own onKilled handler tears down its
- * rrweb capture; this clears the SDK-level state so the SDK reads as
- * "uninitialized" again and stops polling for consent. Bridge already
- * marked itself killed; no need to call destroy().
- */
 function handleBridgeKilled(): void {
   if (recorder) {
     try { recorder.stop(); } catch {}
@@ -413,23 +444,22 @@ function handleBridgeKilled(): void {
   }
   pendingConfig = null;
   lastInitConfig = null;
-  connectionConfig = null;
-  goalsConfig = null;
+  // After a hard kill, fall back to the anonymous tier so we still capture
+  // pre-consent aggregate traffic from any remaining time on the page.
+  // Don't wipe connectionConfig — we may need it if the page is reloaded
+  // and the kill cause was transient.
   storedSessionId = '';
   storedVisitorId = '';
   awaitingRotateResurrection = false;
-  stopPolling();
-  consentGetter = null;
-  lastConsentValue = null;
+  if (activeTier === 'full') {
+    activeTier = 'anonymous';
+    lastConsentLevel = 'anonymous';
+    applyAnonymousActive();
+  }
 }
 
-/**
- * Wire up a new session: mint visitorId (read-or-mint from storage),
- * mint sessionId, open a new bridge, start the recorder. Call when
- * consent is granted from any no-session state.
- */
 function applyConsentGranted(): void {
-  if (recorder) return; // already consented
+  if (recorder) return;
   if (!connectionConfig) {
     console.warn('SessionSight: call init() before granting consent.');
     return;
@@ -481,45 +511,109 @@ function applyConsentGranted(): void {
 }
 
 /**
- * Session-scoped teardown on consent withdrawal. Stops the recorder,
- * destroys the bridge, clears session-scoped state. Preserves the
- * persistent visitor cookie / localStorage so returning users retain
- * their cross-session history.
+ * Tear down the full-tier session. Used by tier transitions and by an
+ * explicit setConsent('anonymous') call. Flushes the buffered events via
+ * keepalive so the operator sees the tail of the just-consented-and-now-
+ * withdrawing session.
+ *
+ * Clears ss_vid + sessionsight_visitor_id + ss_vtoken + ss_sid: the
+ * anonymous tier's zero-persistent-storage rule applies as soon as the
+ * tier flips. A subsequent re-grant mints a fresh visitor (the older
+ * "preserve ss_vid across withdrawals so returning users keep their id"
+ * behaviour is incompatible with the anonymous tier's invariant).
  */
-function applyConsentWithdrawn(): void {
+function teardownFull(): void {
   if (recorder) {
-    recorder.stop();
+    try { recorder.stop(); } catch {}
     recorder = null;
   }
-  // Destroy the underlying bridge if one is outstanding. Covered:
-  // - active-recorder path: recorder.stop() flushes events but doesn't
-  //   destroy the WorkerBridge; we need to kill its WebSocket.
-  // - pending-config path: no recorder attached, bridge held in pendingConfig.
+  // flushAndDestroy on the active bridge sends the tail buffer via
+  // keepalive HTTP so we don't lose the last 6s of the session.
   if (lastInitConfig?.bridge) {
-    try { lastInitConfig.bridge.destroy(); } catch {}
+    try { lastInitConfig.bridge.flushAndDestroy(); } catch {}
   }
   if (pendingConfig?.bridge && pendingConfig.bridge !== lastInitConfig?.bridge) {
     try { pendingConfig.bridge.destroy(); } catch {}
   }
   pendingConfig = null;
 
-  // Session-scoped storage teardown. Visitor cookie + LS preserved.
   clearSessionCookie();
   clearVisitorToken();
+  clearVisitorIdStorage();
   storedSessionId = '';
-  storedVisitorId = ''; // in-memory clear; persistent LS re-read on re-grant
+  storedVisitorId = '';
+  goalsConfig = connectionConfig
+    ? { apiUrl: connectionConfig.apiUrl, apiKey: connectionConfig.apiKey, propertyId: connectionConfig.propertyId }
+    : null;
 
   lastInitConfig = null;
   awaitingRotateResurrection = false;
 }
 
-// ── CMv2 opt-in wiring ───────────────────────────────────────────────
+function clearVisitorIdStorage(): void {
+  if (typeof document !== 'undefined') {
+    try {
+      const secure = typeof location !== 'undefined' && location.protocol === 'https:' ? '; Secure' : '';
+      document.cookie = `ss_vid=; path=/; max-age=0; SameSite=Lax${secure}`;
+    } catch {}
+  }
+  if (typeof window !== 'undefined' && hasLocalStorage()) {
+    try { localStorage.removeItem('sessionsight_visitor_id'); } catch {}
+  }
+}
+
+// ── Anonymous-tier setup / teardown ──────────────────────────────────
+
+function applyAnonymousActive(): void {
+  if (anonymousCapture) return; // already running
+  if (!connectionConfig) {
+    console.warn('SessionSight: call init() before starting anonymous capture.');
+    return;
+  }
+  const { apiUrl, apiKey, propertyId } = connectionConfig;
+
+  // Ephemeral, memory-only per-tab tokens. Never written to cookie / LS / SS.
+  ephemeralVisitorId = generateUUID();
+  ephemeralSessionId = generateUUID();
+  goalsConfig = { apiUrl, apiKey, propertyId };
+
+  anonymousBridge = new AnonymousWorkerBridge({
+    apiUrl,
+    publicApiKey: apiKey,
+    propertyId,
+    ephemeralVisitorId,
+    ephemeralSessionId,
+  });
+  anonymousBridge.onKilled(() => {
+    teardownAnonymous();
+  });
+
+  anonymousCapture = new AnonymousCapture({
+    sink: (e) => { if (anonymousBridge) anonymousBridge.postEvent(e); },
+    privacyConfig: lastPrivacyConfig,
+  });
+  anonymousCapture.start();
+}
+
+function teardownAnonymous(): void {
+  if (anonymousCapture) {
+    try { anonymousCapture.stop(); } catch {}
+    anonymousCapture = null;
+  }
+  if (anonymousBridge) {
+    try { anonymousBridge.flushAndDestroy(); } catch {}
+    anonymousBridge = null;
+  }
+  ephemeralVisitorId = '';
+  ephemeralSessionId = '';
+}
+
+// ── CMv2 opt-in wiring (unchanged shape; granted→full, denied→anonymous) ─
 
 function readCurrentCMv2State(): 'granted' | 'denied' | null {
   if (typeof window === 'undefined') return null;
   const w = window as any;
 
-  // Preferred: gtag('get', 'consent_state'). Not all implementations expose it.
   try {
     if (typeof w.gtag === 'function') {
       let state: any = null;
@@ -530,13 +624,11 @@ function readCurrentCMv2State(): 'granted' | 'denied' | null {
     }
   } catch {}
 
-  // Fallback: walk window.dataLayer backwards for the most recent consent command.
   try {
     const dl: any[] = Array.isArray(w.dataLayer) ? w.dataLayer : [];
     for (let i = dl.length - 1; i >= 0; i--) {
       const row = dl[i];
       if (!row) continue;
-      // dataLayer can contain [consent, update, {...}] or {event:'consent', ...}
       if (Array.isArray(row) && row[0] === 'consent' && (row[1] === 'update' || row[1] === 'default')) {
         const settings = row[2];
         if (settings && typeof settings.analytics_storage === 'string') {
@@ -561,8 +653,7 @@ function installCMv2Observer(): void {
         if (settings && typeof settings.analytics_storage === 'string') {
           if (!cmv2ExplicitOverride) {
             const granted = settings.analytics_storage === 'granted';
-            if (granted) applyConsentGranted();
-            else applyConsentWithdrawn();
+            applyTierTransition(granted ? 'full' : 'anonymous');
           }
         }
       }
@@ -570,7 +661,6 @@ function installCMv2Observer(): void {
       console.warn('SessionSight: CMv2 observer error', err);
     }
     if (originalGtag) return originalGtag.apply(this, args);
-    // Stub fallback: push onto dataLayer so GA/GTM still see the event.
     try {
       const dl: any[] = Array.isArray(w.dataLayer) ? w.dataLayer : (w.dataLayer = []);
       dl.push(Array.from(args));
@@ -583,8 +673,7 @@ function installCMv2Observer(): void {
 function armCMv2FromCurrentState(): void {
   const current = readCurrentCMv2State();
   if (current === null) return;
-  if (current === 'granted') applyConsentGranted();
-  else applyConsentWithdrawn();
+  applyTierTransition(current === 'granted' ? 'full' : 'anonymous');
   cmv2ExplicitOverride = false;
 }
 
@@ -598,7 +687,7 @@ const SessionSight = {
         return;
       }
 
-      if (recorder || pendingConfig || connectionConfig) {
+      if (recorder || pendingConfig || connectionConfig || anonymousCapture) {
         console.warn('SessionSight is already initialized.');
         return;
       }
@@ -618,9 +707,6 @@ const SessionSight = {
       connectionConfig = { apiUrl, apiKey: config.publicApiKey, propertyId, autoRecord };
       goalsConfig = { apiUrl, apiKey: config.publicApiKey, propertyId };
 
-      // SDK-level visibility/idle/focus listeners live across the SDK's
-      // lifetime. They are registered once here and not reset on consent
-      // transitions so resurrection after setConsent(true) still works.
       if (!visibilityResurrectionListener) {
         visibilityResurrectionListener = handleVisibilityResurrection;
         document.addEventListener('visibilitychange', visibilityResurrectionListener);
@@ -637,32 +723,36 @@ const SessionSight = {
         document.addEventListener('visibilitychange', focusCookieListener);
       }
 
-      // CMv2 opt-in wiring. Install the gtag observer and read the
-      // current state if honorConsentMode is on. Explicit setConsent()
-      // calls after this point take precedence over CMv2 updates.
       const consentOption = config.consent;
+      const gpcSuppressed = shouldSuppressPersistentId();
+
       if (config.honorConsentMode) {
         cmv2Enabled = true;
         installCMv2Observer();
 
         const cmv2State = readCurrentCMv2State();
         if (cmv2State !== null) {
-          if (cmv2State === 'granted') applyConsentGranted();
-          // 'denied' is the no-session state; nothing to do.
+          const target: ConsentLevel = gpcSuppressed
+            ? 'anonymous'
+            : cmv2State === 'granted' ? 'full' : 'anonymous';
+          applyTierTransition(target);
           return;
         }
         // No CMv2 signal present; fall through to the `consent` init param.
       }
 
       if (typeof consentOption === 'function') {
-        consentGetter = consentOption;
-        const initialValue = consentGetter();
-        lastConsentValue = initialValue;
-        if (initialValue) applyConsentGranted();
+        consentGetter = () => coerceLevel(consentOption());
+        const initialDesired = consentGetter();
+        const target: ConsentLevel = gpcSuppressed ? 'anonymous' : initialDesired;
+        applyTierTransition(target);
         startPolling();
       } else {
-        const consent = consentOption !== false;
-        if (consent) applyConsentGranted();
+        // Default: full tier (backwards-compatible with the old `true` default).
+        // GPC/DNT pins to anonymous regardless.
+        const desired: ConsentLevel = consentOption === undefined ? 'full' : coerceLevel(consentOption);
+        const target: ConsentLevel = gpcSuppressed ? 'anonymous' : desired;
+        applyTierTransition(target);
       }
     } catch (e) {
       console.warn('SessionSight: failed to initialize', e);
@@ -670,52 +760,32 @@ const SessionSight = {
   },
 
   /**
-   * Grant or withdraw consent. Explicit calls win over CMv2 signals
-   * until followConsentMode() re-arms. `setConsent(false)` performs
-   * session-scoped teardown (preserves ss_vid for returning users);
-   * `setConsent(true)` reads-or-mints the visitor and opens a new session.
+   * Programmatically set the consent tier. Accepts the modern `ConsentLevel`
+   * string or the legacy boolean (`true` → 'full', `false` → 'anonymous').
+   * Explicit calls win over CMv2 signals until followConsentMode() re-arms.
+   *
+   * GPC/DNT still pins to 'anonymous' even when you pass 'full'.
    */
-  setConsent(granted: boolean): void {
+  setConsent(level: ConsentLevel | boolean): void {
     cmv2ExplicitOverride = true;
-    if (granted) {
-      if (recorder) return; // already consented
-      applyConsentGranted();
-      lastConsentValue = true;
-    } else {
-      if (!recorder && !pendingConfig && !storedSessionId) return; // already withdrawn
-      applyConsentWithdrawn();
-      lastConsentValue = false;
-    }
+    const desired = coerceLevel(level);
+    const target: ConsentLevel = shouldSuppressPersistentId() ? 'anonymous' : desired;
+    applyTierTransition(target);
   },
 
-  /**
-   * Re-arm CMv2 listening: clear the explicit-override lock and adopt
-   * the current CMv2 state. No-op when honorConsentMode was not enabled
-   * at init.
-   */
   followConsentMode(): void {
     if (!cmv2Enabled) return;
     armCMv2FromCurrentState();
   },
 
-  /**
-   * Begin the user-triggered recording stream. Only effective when
-   * consent has been granted (i.e., a session exists). No-op otherwise.
-   */
   startRecording(options?: RecordOptions): void {
     if (recorder) recorder.beginRecording(options);
   },
 
-  /**
-   * Pause rrweb capture without touching the session, identity, or
-   * consent. Goals, feedback, and split-test exposures continue to fire
-   * while paused. No-op in the no-session state.
-   */
   stopRecording(): void {
     if (recorder) recorder.pause();
   },
 
-  /** Resume rrweb capture paused by stopRecording(). No-op in the no-session state. */
   resumeRecording(): void {
     if (recorder) recorder.resume();
   },
@@ -729,49 +799,23 @@ const SessionSight = {
     },
   },
 
-  /**
-   * Bind identity and/or custom data to the current visitor.
-   *
-   * Accepts a flat object:
-   *
-   *   SessionSight.identify({
-   *     id?: string,       // opaque stable identifier (your internal user id)
-   *     email?: string,    // canonical email slot (normalized to lowercase + trim)
-   *     ...customProperties,
-   *   });
-   *
-   * Both `id` and `email` are optional. An empty `{}` is a no-op. A call
-   * with only custom properties (no `id`, no `email`) binds data to the
-   * current anonymous visitor without claiming an identity.
-   *
-   * Throws synchronously on validation failure:
-   *  - email-shaped value passed as `id`
-   *  - PII (SSN/cc/credentials/phone) in `id`
-   *  - invalid email shape, or oversized id/email
-   *  - reserved-key collision in custom properties
-   *  - oversized custom property key/value, or more than the allowed cap
-   *  - wrong type (custom properties must be string/number/boolean)
-   *
-   * Silently drops, per the existing per-value PII rule:
-   *  - custom property keys matching the PII regex
-   *  - string-typed custom property values matching the PII regex
-   *
-   * No-op in the no-session state (consent withdrawn): identity is
-   * meaningless without a session to attach it to. Callers must re-call
-   * identify() after a consent re-grant (which opens a new session).
-   */
   identify(payload: { id?: string; email?: string } & Record<string, string | number | boolean | undefined>): void {
+    // identify is a full-tier-only operation. Linking aggregate counters to
+    // an identity would defeat the anonymous tier's invariant.
+    if (activeTier !== 'full') return;
     const parsed = parseIdentifyPayload(payload);
-    if (!parsed) return; // empty / all-dropped → no network call
+    if (!parsed) return;
     if (recorder) recorder.identify(parsed);
   },
 
-  /** Returns the current session's visitorId, or null in the no-session state. */
+  /**
+   * Returns the persistent visitorId for the current full-tier session,
+   * or null when the SDK is running anonymously (pre-banner, declined, or
+   * under GPC/DNT). Never returns the ephemeral per-tab id; exposing it to
+   * other JS on the page would defeat the anonymous tier's invariant.
+   */
   getVisitorId(): string | null {
-    // Prefer the recorder's id (it tracks bootstrap-recovery swaps via the
-    // bridge's onVisitorIdSwap callback), but fall through to storedVisitorId
-    // when no recorder is attached (rotateSession() pending-config phase) or
-    // the recorder doesn't have a value yet.
+    if (activeTier !== 'full') return null;
     return (recorder?.getVisitorId() || storedVisitorId) || null;
   },
 };

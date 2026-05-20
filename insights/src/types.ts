@@ -1,15 +1,29 @@
+/**
+ * Two-tier consent surfaced to the SDK.
+ *  - 'anonymous': cookieless/storageless aggregate capture (pre-banner default).
+ *  - 'full': identified session capture with replay (requires explicit Accept).
+ *
+ * Mirrored from `@sessionsight/shared` so the SDK doesn't pull the entire
+ * shared package into the browser bundle.
+ */
+export type ConsentLevel = 'anonymous' | 'full';
+
 export interface SessionSightConfig {
   publicApiKey: string;
   propertyId?: string; // defaults to 'dev' (localhost)
   apiUrl?: string;  // defaults to https://api.sessionsight.com
   autoRecord?: boolean; // default true. Set to false for manual recording control
   /**
-   * Consent state. Defaults to true. Pass false to defer until
-   * setConsent(true), or a getter function for reactive consent (polled
-   * every second). On withdrawal the SDK detaches from the current
-   * session; on grant it reads-or-mints a visitor and opens a new session.
+   * Consent level. Defaults to 'full' for backwards compatibility with the
+   * old boolean `true` default; integrators wiring a banner should pass a
+   * getter that returns 'anonymous' pre-Accept and 'full' post-Accept.
+   *
+   * Boolean is still accepted for legacy callers: `true` → 'full',
+   * `false` → 'anonymous'. There is no "off" — the SDK always runs at
+   * least the anonymous tier. GPC/DNT pins the tier to 'anonymous'
+   * regardless of what this returns.
    */
-  consent?: boolean | (() => boolean);
+  consent?: ConsentLevel | boolean | (() => ConsentLevel | boolean);
   /**
    * Opt into Google Consent Mode v2 auto-wiring. When true, the SDK
    * reads `analytics_storage` at init and observes subsequent

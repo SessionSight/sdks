@@ -1,8 +1,8 @@
 import { SplitTestingClient, BoundSplitTestingClient } from './client.js';
-import type { SplitTestConfig, GetOptions } from './types.js';
+import type { SplitTestConfig } from './types.js';
 
 export { SplitTestingClient, BoundSplitTestingClient };
-export type { SplitTestConfig, GetOptions, AssignedVariation, Assignment, SplitTestConfigResponse } from './types.js';
+export type { SplitTestConfig, AssignedVariation, Assignment, SplitTestConfigResponse } from './types.js';
 
 let instance: SplitTestingClient | null = null;
 
@@ -16,12 +16,12 @@ const SplitTesting = {
     await instance.init();
   },
 
-  get(testKey: string, defaultValue: any, options?: GetOptions): any {
+  get(testKey: string, defaultValue: any): any {
     if (!instance) {
       console.warn('[SessionSight SplitTesting] Not initialized. Call init() first.');
       return defaultValue;
     }
-    return instance.get(testKey, defaultValue, options);
+    return instance.get(testKey, defaultValue);
   },
 
   setAttributes(attrs: Record<string, string | number | boolean>): void {

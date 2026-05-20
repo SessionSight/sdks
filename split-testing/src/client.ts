@@ -3,7 +3,6 @@ import type {
   SplitTestConfigResponse,
   Assignment,
   AssignedVariation,
-  GetOptions,
 } from './types.js';
 import { splitTestHash, assignVariation } from './hash.js';
 import {
@@ -136,7 +135,7 @@ export class SplitTestingClient {
     }
   }
 
-  get(testKey: string, defaultValue: any, _options?: GetOptions): any {
+  get(testKey: string, defaultValue: any): any {
     if (!this.initialized) {
       console.warn('[SessionSight SplitTesting] Not initialized. Call init() first.');
       return defaultValue;
@@ -455,8 +454,8 @@ export class BoundSplitTestingClient {
   ) {}
 
   async init(): Promise<void> { return this.client.init(); }
-  get<T extends string | boolean | number | object>(testKey: string, defaultValue: T, options?: GetOptions): T {
-    return this.client.get(testKey, defaultValue, options);
+  get<T extends string | boolean | number | object>(testKey: string, defaultValue: T): T {
+    return this.client.get(testKey, defaultValue);
   }
   destroy(): void { this.client.destroy(); }
 

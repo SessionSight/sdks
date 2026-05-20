@@ -91,12 +91,38 @@ mock.module('../src/worker-bridge.js', () => ({
     onQuotaExceeded(_cb: Function) {}
     onRotate(_cb: Function) {}
     onKilled(_cb: Function) {}
+    onVisitorIdSwap(_cb: Function) {}
     postEvent() {}
     postMetadata() {}
     postIdentify() {}
     flush() {}
     sendBeacon() {}
+    flushAndDestroy() {}
     destroy() {}
+  },
+}));
+
+// Stub the anonymous-tier transport so setConsent(false) doesn't try to
+// spin up a real worker. The goals tests only exercise the full-tier
+// sendBeacon path; the anonymous path is covered in consent-and-cmv2.test.ts.
+mock.module('../src/anonymous-worker-bridge.js', () => ({
+  AnonymousWorkerBridge: class {
+    constructor(_opts: any) {}
+    onKilled(_cb: Function) {}
+    postEvent() {}
+    flush() {}
+    flushAndDestroy() {}
+    destroy() {}
+  },
+}));
+
+mock.module('../src/anonymous-capture.js', () => ({
+  AnonymousCapture: class {
+    constructor(_opts: any) {}
+    start() {}
+    stop() {}
+    applyPrivacyConfig() {}
+    emitGoalCount() {}
   },
 }));
 
@@ -193,17 +219,16 @@ describe('SessionSight.goals namespace', () => {
     expect(beaconCalls).toHaveLength(0);
   });
 
-  test('setConsent(false) puts the SDK in the no-session state; goals become silent no-ops', async () => {
+  test('setConsent(false) flips to anonymous tier; goals route to the anon transport, not sendBeacon', async () => {
     const SessionSight = await freshSessionSight();
     SessionSight.init({ publicApiKey: 'pk_test', propertyId: 'prop-1', apiUrl: 'https://api.example.com' });
     SessionSight.setConsent(false);
 
-    // Under the session-as-identity model, goals are session-scoped.
-    // Without a session the SDK has nothing to attribute the fire to;
-    // rather than sending a sessionless record the API can't interpret,
-    // the call is a no-op.
+    // Anonymous tier counts goal fires through the anonymous transport
+    // (no per-visitor attribution; counters only). sendBeacon is the
+    // full-tier path and must NOT fire here.
     const result = SessionSight.goals.increment('purchase');
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
     expect(beaconCalls).toHaveLength(0);
   });
 });

@@ -43,7 +43,3 @@ export interface Assignment {
   inTest: boolean;
 }
 
-export interface GetOptions {
-  // Reserved for future use
-  [key: string]: any;
-}
