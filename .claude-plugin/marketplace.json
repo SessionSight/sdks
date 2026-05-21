@@ -1,0 +1,14 @@
+{
+  "name": "sessionsight-sdks",
+  "owner": {
+    "name": "SessionSight",
+    "email": "support@sessionsight.com"
+  },
+  "plugins": [
+    {
+      "name": "sessionsight",
+      "source": "./claude-code-plugin",
+      "description": "Use SessionSight from Claude Code to grow your users."
+    }
+  ]
+}

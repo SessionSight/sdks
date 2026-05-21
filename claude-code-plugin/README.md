@@ -18,10 +18,11 @@ When you ask Claude to wire a goal, split test, or feature flag into your code, 
 
 ## Install
 
-One command. Authentication happens on your first tool call.
+Two commands. Authentication happens on your first tool call.
 
 ```bash
-/plugin install sessionsight@claude-plugins-official
+/plugin marketplace add SessionSight/sdks
+/plugin install sessionsight@sessionsight-sdks
 ```
 
 Then ask the agent anything that needs SessionSight, e.g.:
