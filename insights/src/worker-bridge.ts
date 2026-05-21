@@ -38,7 +38,7 @@ export class WorkerBridge {
 
   // Callbacks
   private onPrivacyCallback: ((config: PrivacyConfig) => void) | null = null;
-  private onKilledCallbacks: Array<() => void> = [];
+  private onKilledCallbacks: Array<(reason?: string) => void> = [];
   private onQuotaExceededCallback: (() => void) | null = null;
   private onRotateCallback: ((reason?: string) => void) | null = null;
   private onVisitorIdSwapCallbacks: Array<(visitorId: string) => void> = [];
@@ -307,7 +307,7 @@ export class WorkerBridge {
    * supported so both Recorder (clears recorder state) and index.ts (clears
    * module-level state) can react.
    */
-  onKilled(callback: () => void): void {
+  onKilled(callback: (reason?: string) => void): void {
     this.onKilledCallbacks.push(callback);
   }
 
@@ -385,7 +385,7 @@ export class WorkerBridge {
         case 'killed':
           this._killed = true;
           for (const cb of this.onKilledCallbacks) {
-            try { cb(); } catch (err) { console.warn('SessionSight: onKilled callback threw', err); }
+            try { cb(msg.reason); } catch (err) { console.warn('SessionSight: onKilled callback threw', err); }
           }
           break;
 

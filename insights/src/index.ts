@@ -159,6 +159,17 @@ let storedVisitorId: string = '';
 let storedSessionId: string = '';
 let goalsConfig: { apiUrl: string; apiKey: string; propertyId: string } | null = null;
 let quotaExceeded = false;
+/**
+ * Set once a transport reports a terminal kill (invalid API key, revoked
+ * origin, subscription required). Prevents the consent poll from re-firing
+ * `applyTierTransition` and spinning a fresh bridge every second: without
+ * this gate, a full-tier 401 → fall-to-anonymous → anonymous 401 chain
+ * leaves `lastConsentLevel='anonymous'` while the consent getter still
+ * returns 'full', so the next poll tick re-applies full and the cycle
+ * repeats. Reset on `init()` (page reloads start fresh) and explicit
+ * `setConsent()` (user retry intent).
+ */
+let transportKilled = false;
 
 // ── Tier state (consent level + anonymous bridge) ────────────────────
 
@@ -268,11 +279,15 @@ function cachePrivacyConfig(propertyId: string, config: PrivacyConfig): void {
 // ── Consent polling ──────────────────────────────────────────────────
 
 function pollConsent(): void {
+  if (transportKilled) {
+    stopPolling();
+    return;
+  }
   if (!consentGetter) return;
   const desired = consentGetter();
   // GPC/DNT pins the level to anonymous, regardless of what the getter
   // returned. A user who set GPC and explicitly clicked Accept still gets
-  // anonymous-tier capture — lines up with the spirit of GPC's "don't
+  // anonymous-tier capture, lines up with the spirit of GPC's "don't
   // profile" signal.
   const target: ConsentLevel = shouldSuppressPersistentId() ? 'anonymous' : desired;
   if (target === lastConsentLevel) return;
@@ -314,6 +329,7 @@ function stopPolling(): void {
  * Accept into a needless 401 → bootstrap → re-mint cycle.
  */
 function applyTierTransition(target: ConsentLevel): void {
+  if (transportKilled) return;
   if (target === lastConsentLevel) return;
 
   if (lastConsentLevel === 'full') teardownFull();
@@ -437,7 +453,7 @@ function handleFocusCookieWrite(): void {
 
 // ── Full-tier setup / teardown ───────────────────────────────────────
 
-function handleBridgeKilled(): void {
+function handleBridgeKilled(reason?: string): void {
   if (recorder) {
     try { recorder.stop(); } catch {}
     recorder = null;
@@ -446,15 +462,36 @@ function handleBridgeKilled(): void {
   lastInitConfig = null;
   // After a hard kill, fall back to the anonymous tier so we still capture
   // pre-consent aggregate traffic from any remaining time on the page.
-  // Don't wipe connectionConfig — we may need it if the page is reloaded
+  // Don't wipe connectionConfig, we may need it if the page is reloaded
   // and the kill cause was transient.
   storedSessionId = '';
   storedVisitorId = '';
   awaitingRotateResurrection = false;
-  if (activeTier === 'full') {
+  logKillReason('full', reason);
+  // Anonymous fallback is only useful for kills that aren't auth/billing
+  // failures (e.g. a transient WS misconfig). For invalid_api_key and
+  // subscription_required, the anonymous tier would hit the same wall and
+  // emit a duplicate warning, so skip straight to disabling.
+  const fatalForBothTiers = reason === 'invalid_api_key' || reason === 'subscription_required';
+  if (activeTier === 'full' && !fatalForBothTiers) {
     activeTier = 'anonymous';
     lastConsentLevel = 'anonymous';
     applyAnonymousActive();
+  } else {
+    transportKilled = true;
+    stopPolling();
+  }
+}
+
+function logKillReason(tier: 'full' | 'anonymous', reason?: string): void {
+  if (reason === 'invalid_api_key') {
+    console.warn(`[SessionSight] ${tier}-tier capture stopped: the API key was rejected. Check publicApiKey + propertyId match a property on this account.`);
+  } else if (reason === 'subscription_required') {
+    console.warn(`[SessionSight] ${tier}-tier capture stopped: this property's plan does not allow ingest. Activate billing to resume.`);
+  } else if (reason) {
+    console.warn(`[SessionSight] ${tier}-tier capture stopped (${reason}).`);
+  } else {
+    console.warn(`[SessionSight] ${tier}-tier capture stopped.`);
   }
 }
 
@@ -584,8 +621,15 @@ function applyAnonymousActive(): void {
     ephemeralVisitorId,
     ephemeralSessionId,
   });
-  anonymousBridge.onKilled(() => {
+  anonymousBridge.onKilled((reason) => {
     teardownAnonymous();
+    logKillReason('anonymous', reason);
+    // Anonymous-tier kill is terminal for the page lifecycle: the same API
+    // key would fail again on the next tick. Mark dead and stop polling so
+    // the consent loop doesn't reanimate full-tier (and bounce right back
+    // through here) every second.
+    transportKilled = true;
+    stopPolling();
   });
 
   anonymousCapture = new AnonymousCapture({
@@ -768,6 +812,7 @@ const SessionSight = {
    */
   setConsent(level: ConsentLevel | boolean): void {
     cmv2ExplicitOverride = true;
+    transportKilled = false;
     const desired = coerceLevel(level);
     const target: ConsentLevel = shouldSuppressPersistentId() ? 'anonymous' : desired;
     applyTierTransition(target);

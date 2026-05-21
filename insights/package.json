@@ -1,6 +1,6 @@
 {
   "name": "@sessionsight/insights",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Session replay, heatmaps, and user analytics SDK for SessionSight.",
   "author": "SessionSight",
   "license": "MIT",
@@ -52,8 +52,8 @@
   },
   "scripts": {
     "verify-hint": "bun run scripts/verify-hint.ts",
-    "prebuild": "bun run verify-hint",
-    "prepublishOnly": "bun run verify-hint",
+    "prebuild": "bun run build.ts --worker-only && bun run verify-hint",
+    "prepublishOnly": "bun run build.ts --worker-only && bun run verify-hint",
     "pretest": "bun run build:worker",
     "build": "bun run build.ts",
     "build:worker": "bun run build.ts --worker-only",

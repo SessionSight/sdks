@@ -30,7 +30,7 @@ export class AnonymousWorkerBridge {
   private fallbackBuffer: AnonymousEvent[] = [];
   private fallbackTimer: ReturnType<typeof setInterval> | null = null;
 
-  private onKilledCallbacks: Array<() => void> = [];
+  private onKilledCallbacks: Array<(reason?: string) => void> = [];
 
   constructor(opts: {
     apiUrl: string;
@@ -137,7 +137,7 @@ export class AnonymousWorkerBridge {
     this.killed = true;
   }
 
-  onKilled(cb: () => void): void {
+  onKilled(cb: (reason?: string) => void): void {
     this.onKilledCallbacks.push(cb);
   }
 
@@ -149,7 +149,7 @@ export class AnonymousWorkerBridge {
       if (msg?.type === 'killed') {
         this.killed = true;
         for (const cb of this.onKilledCallbacks) {
-          try { cb(); } catch {}
+          try { cb(msg.reason); } catch {}
         }
       }
     } catch {
@@ -207,8 +207,9 @@ export class AnonymousWorkerBridge {
           clearInterval(this.fallbackTimer);
           this.fallbackTimer = null;
         }
+        const reason = res.status === 402 ? 'subscription_required' : 'invalid_api_key';
         for (const cb of this.onKilledCallbacks) {
-          try { cb(); } catch {}
+          try { cb(reason); } catch {}
         }
         return;
       }
