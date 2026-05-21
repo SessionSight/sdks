@@ -23,8 +23,7 @@
     "dist/index.js",
     "dist/index.d.ts",
     "dist/client.d.ts",
-    "dist/types.d.ts",
-    "dist/integration-hint.d.ts"
+    "dist/types.d.ts"
   ],
   "type": "module",
   "main": "./src/index.ts",
@@ -44,12 +43,8 @@
     "types": "./dist/index.d.ts",
     "exports": {
       ".": {
-        "import": "./dist/index.js",
-        "types": "./dist/index.d.ts"
-      },
-      "./integration-hint": {
-        "import": "./dist/integration-hint.js",
-        "types": "./dist/integration-hint.d.ts"
+        "types": "./dist/index.d.ts",
+        "import": "./dist/index.js"
       }
     }
   },

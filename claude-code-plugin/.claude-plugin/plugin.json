@@ -1,7 +1,7 @@
 {
   "name": "sessionsight",
   "description": "Use SessionSight from Claude Code to grow your users.",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": {
     "name": "SessionSight",
     "email": "support@sessionsight.com",
@@ -24,7 +24,9 @@
   "mcpServers": {
     "sessionsight": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/sessionsight-mcp.js"]
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/bin/sessionsight-mcp.js"
+      ]
     }
   }
 }
