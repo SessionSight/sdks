@@ -18,6 +18,9 @@ import {
   extractIdsFromRequest,
   normalizeApiUrl,
   fetchWithTimeout,
+  getStoredVisitorToken,
+  bootstrapVisitorToken,
+  writeVisitorId,
 } from '@sessionsight/sdk-shared';
 
 const DEFAULT_STALE_TTL = 0;
@@ -366,12 +369,66 @@ export class SplitTestingClient {
     const exposures = [...this.pendingExposures];
     this.pendingExposures = [];
 
-    const body: Record<string, any> = {
-      propertyId: this.propertyId,
-      exposures,
-    };
+    // The expose route now requires a verified visitor token. Fast-path
+    // if we already have one; otherwise bootstrap on the fly. The exposure
+    // batch is held back during bootstrap rather than dropped — these
+    // are audit rows that the dashboard needs for variation conversion
+    // rates, so silent loss would corrupt experiment results.
+    this.sendExposureBatch(exposures);
+  }
 
-    this.sendBeacon(`${this.apiUrl}/v1/split-testing/expose`, body);
+  /**
+   * Send an exposure batch, bootstrapping the visitor token first if we
+   * don't have one cached. Bootstrap is best-effort: a failure logs and
+   * drops the batch (the alternative — retrying indefinitely — would
+   * pile exposures up in memory across page lifecycles).
+   */
+  private sendExposureBatch(
+    exposures: Array<{
+      splitTestKey: string;
+      variationKey: string;
+      sessionId: string;
+      timestamp: number;
+      attributes: Record<string, string | number | boolean>;
+    }>,
+  ): void {
+    const storedToken = getStoredVisitorToken();
+    if (storedToken) {
+      const body: Record<string, any> = {
+        propertyId: this.propertyId,
+        visitorId: this.visitorId,
+        visitorToken: storedToken,
+        exposures,
+      };
+      this.sendBeacon(`${this.apiUrl}/v1/split-testing/expose`, body);
+      return;
+    }
+    // No token cached. Bootstrap on the main thread and post once it lands.
+    bootstrapVisitorToken({
+      apiUrl: this.apiUrl,
+      publicApiKey: this.publicApiKey,
+      propertyId: this.propertyId,
+      clientVisitorId: this.visitorId,
+    })
+      .then((result) => {
+        if (result.visitorId !== this.visitorId) {
+          this.visitorId = result.visitorId;
+          writeVisitorId(result.visitorId);
+        }
+        const body: Record<string, any> = {
+          propertyId: this.propertyId,
+          visitorId: this.visitorId,
+          visitorToken: result.visitorToken,
+          exposures,
+        };
+        this.sendBeacon(`${this.apiUrl}/v1/split-testing/expose`, body);
+      })
+      .catch(() => {
+        // Bootstrap failed; the exposures cannot be sent without a
+        // token. Surrendering the batch is the right call: a retry
+        // loop would compound on every page that triggers another
+        // get() and never converge if the API key itself is wrong.
+      });
   }
 
   private sendBeacon(url: string, body: any): void {
@@ -434,11 +491,8 @@ export class SplitTestingClient {
     // was captured at track time. No session → skip the flush; there's
     // no audit record we can write coherently.
     if (!ids.sessionId) return;
-    const body: Record<string, any> = {
-      propertyId: this.propertyId,
-      exposures: exposures.map(e => ({ ...e, sessionId: ids.sessionId as string })),
-    };
-    this.sendBeacon(`${this.apiUrl}/v1/split-testing/expose`, body);
+    const rebound = exposures.map(e => ({ ...e, sessionId: ids.sessionId as string }));
+    this.sendExposureBatch(rebound);
   }
 }
 

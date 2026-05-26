@@ -4,6 +4,12 @@ import {
   getRegistryValue,
   redactString,
   stripUrlQuery,
+  externalReferrer,
+  sanitizeErrorText,
+  globToRegex,
+  matchesAnyPattern,
+  patchHistoryMethods,
+  ERROR_DEDUP_WINDOW_MS,
   REDACTED,
   SS_BLOCKED_ATTR,
   SS_ALLOW_ATTR,
@@ -1136,25 +1142,6 @@ export function scrubMediaInEvent(event: eventWithTime, mirror: RrwebMirror | nu
 
 // ── Page Exclusion Pattern Matching ────────────────────────────────
 
-function globToRegex(pattern: string): RegExp | null {
-  try {
-    // Escape regex special chars except *, then convert * to .*
-    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&');
-    const regexStr = '^' + escaped.replace(/\*/g, '.*') + '$';
-    return new RegExp(regexStr);
-  } catch (e) {
-    console.warn('SessionSight: invalid excludePages pattern', pattern, e);
-    return null;
-  }
-}
-
-function matchesAnyPattern(path: string, patterns: RegExp[]): boolean {
-  for (const regex of patterns) {
-    if (regex.test(path)) return true;
-  }
-  return false;
-}
-
 /**
  * Serialize every `@font-face` rule from the live document by walking
  * `document.styleSheets` and reading each descriptor individually via
@@ -1274,6 +1261,67 @@ async function serializeDocumentFonts(): Promise<string> {
   return blocks.join('\n');
 }
 
+/**
+ * Recover the FULL body of every cross-origin stylesheet that rrweb's
+ * `inlineStylesheet: true` capture could not read.
+ *
+ * Why this exists: rrweb walks `document.styleSheets[i].cssRules` to inline
+ * each rule into a `<style>` block. CSSOM access throws SecurityError on any
+ * sheet whose origin doesn't grant CORS read access (the canonical case is a
+ * `<link rel="stylesheet">` to a CDN loaded without `crossorigin="anonymous"`).
+ * When inline fails, rrweb keeps the original `<link>` tag in the snapshot.
+ * At replay time the iframe (hosted on a different origin) tries to fetch
+ * that href and typically fails, leaving the recording rendered with bare
+ * unstyled HTML — large icons, no layout, stacked content.
+ *
+ * Recovery path: refetch each unreadable sheet through `fetch()`, which is a
+ * different CORS path that CDNs generally allow. Concatenate the bodies into
+ * a single CSS blob and emit it as the `ss_styles` custom event; the replayer
+ * sanitizes and injects it as a `<style>` block on every FullSnapshot rebuild
+ * so the rules win the cascade over whatever empty `<link>` rrweb captured.
+ *
+ * `stripStylesheetUrls` runs over the fetched text so non-font url() refs
+ * (background-image, cursor, mask, border-image, list-style-image) get
+ * replaced with the same hatch gradient stand-in used elsewhere in the
+ * recorder. @font-face src urls survive because fonts are needed for visual
+ * fidelity and are independently guarded by the ss_fonts trust boundary.
+ *
+ * `credentials: 'omit'` keeps cookies/auth out of every request so the
+ * server treats each fetch as a public CSS retrieval.
+ */
+async function serializeCrossOriginStylesheets(): Promise<string> {
+  if (typeof document === 'undefined' || !document.styleSheets) return '';
+  const fetchList: string[] = [];
+  for (const sheet of Array.from(document.styleSheets)) {
+    try {
+      // Probe cssRules; success means rrweb could read it too, so the
+      // sheet is already in the snapshot and we have nothing to recover.
+      void sheet.cssRules;
+    } catch {
+      if (sheet.href) fetchList.push(sheet.href);
+    }
+  }
+  if (fetchList.length === 0) return '';
+
+  const bodies: string[] = [];
+  await Promise.all(
+    fetchList.map(async (href) => {
+      try {
+        const res = await fetch(href, { credentials: 'omit' });
+        if (!res.ok) return;
+        const text = await res.text();
+        if (typeof text !== 'string' || text.length === 0) return;
+        const stripped = stripStylesheetUrls(text);
+        bodies.push(stripped);
+      } catch {
+        // Network/CORS failure; skip silently. The replay falls back to
+        // rrweb's lossy `<link>` capture for this sheet.
+      }
+    }),
+  );
+  return bodies.join('\n');
+}
+
 export class Recorder {
   private bridge: WorkerBridge;
   private visitorId: string;
@@ -1293,8 +1341,7 @@ export class Recorder {
   private lastHref: string = '';
   private lastEmittedFlagToken: string | null = null;
   private flagCheckTimer: ReturnType<typeof setInterval> | null = null;
-  private origPushState: typeof history.pushState | null = null;
-  private origReplaceState: typeof history.replaceState | null = null;
+  private unpatchHistory: (() => void) | null = null;
 
   // Form tracking state
   private formStarted = new Set<string>();
@@ -1448,8 +1495,11 @@ export class Recorder {
         this.isPaused = true;
       }
 
-      // Track SPA navigations
-      this.patchHistoryMethods();
+      // Track SPA navigations. Guard idempotency: a double-start would
+      // otherwise register two subscribers and orphan the first unsub
+      // handle. The recorder has no caller-side `started` guard, so the
+      // guard lives here.
+      if (!this.unpatchHistory) this.unpatchHistory = patchHistoryMethods(this.handleNavigation);
       window.addEventListener('popstate', this.handleNavigation);
 
       // Track user interactions
@@ -1567,7 +1617,7 @@ export class Recorder {
       this.mediaResizeObserver = null;
     }
 
-    this.unpatchHistoryMethods();
+    if (this.unpatchHistory) { this.unpatchHistory(); this.unpatchHistory = null; }
     window.removeEventListener('popstate', this.handleNavigation);
 
     document.removeEventListener('submit', this.handleFormSubmit, true);
@@ -1874,6 +1924,18 @@ export class Recorder {
       void serializeDocumentFonts().then((fontCss) => {
         if (fontCss.length > 0) {
           this.emitCustomEvent('ss_fonts', { css: fontCss });
+        }
+      });
+
+      // Recover the full bodies of cross-origin stylesheets that rrweb's
+      // `inlineStylesheet: true` capture could not read via CSSOM. The
+      // replayer injects this CSS as a `<style>` block on every
+      // FullSnapshot rebuild so the rules win the cascade over the
+      // surviving `<link>` tags rrweb fell back to. Fire-and-forget so
+      // bring-up is not blocked by the network fetches.
+      void serializeCrossOriginStylesheets().then((styleCss) => {
+        if (styleCss.length > 0) {
+          this.emitCustomEvent('ss_styles', { css: styleCss });
         }
       });
     } catch (e) {
@@ -2796,17 +2858,6 @@ export class Recorder {
 
   // ── Error tracking ───────────────────────────────────────────────
 
-  /**
-   * Strip PII and URL query/fragment from an error message or stack trace.
-   * Routes through redactString (full PII matrix: emails, phones, credit
-   * cards, SSNs, IBANs, JWTs, API keys) and additionally drops query/fragment
-   * from any embedded http(s) URLs so OAuth implicit-flow tokens
-   * (#access_token=...) and reset-link tokens never reach the server.
-   */
-  private sanitizeErrorText(str: string): string {
-    return redactString(str).replace(/(https?:\/\/[^\s?#]+)[?#][^\s)"]*/g, '$1');
-  }
-
   private emitErrorEvent(data: {
     message: string;
     stack: string;
@@ -2816,13 +2867,19 @@ export class Recorder {
     type: 'uncaught' | 'unhandled_rejection';
   }): void {
     const now = Date.now();
-    if (data.message === this.lastErrorMessage && now - this.lastErrorTime < 1000) return;
-    this.lastErrorMessage = data.message;
+    // Dedupe on the *sanitized* message. Two thrown Errors that differ
+    // only in PII collapse to the same emitted text post-sanitize, so
+    // emitting both would put duplicate-looking events on the wire. The
+    // anonymous tier dedupes the same way; both must agree or per-tier
+    // error counts diverge for the same underlying errors.
+    const sanitizedMessage = sanitizeErrorText(data.message);
+    if (sanitizedMessage === this.lastErrorMessage && now - this.lastErrorTime < ERROR_DEDUP_WINDOW_MS) return;
+    this.lastErrorMessage = sanitizedMessage;
     this.lastErrorTime = now;
 
     this.emitCustomEvent('error', {
-      message: this.sanitizeErrorText(data.message),
-      stack: this.sanitizeErrorText(data.stack),
+      message: sanitizedMessage,
+      stack: sanitizeErrorText(data.stack),
       source: stripUrlQuery(data.source),
       lineno: data.lineno,
       colno: data.colno,
@@ -2904,32 +2961,6 @@ export class Recorder {
   };
 
   // ── SPA navigation tracking ────────────────────────────────────────
-
-  private patchHistoryMethods(): void {
-    const nativePushState = History.prototype.pushState;
-    const nativeReplaceState = History.prototype.replaceState;
-    this.origPushState = history.pushState.bind(history);
-    this.origReplaceState = history.replaceState.bind(history);
-    const self = this;
-    history.pushState = function (...args: Parameters<typeof history.pushState>) {
-      // Use saved original if available, fall back to native prototype method.
-      // Another library may hold a reference to this patched function after we
-      // unpatch (setting origPushState to null), so we must never throw.
-      const fn = self.origPushState || nativePushState.bind(history);
-      fn(...args);
-      try { self.handleNavigation(); } catch (e) { console.warn('SessionSight: error in pushState handler', e); }
-    };
-    history.replaceState = function (...args: Parameters<typeof history.replaceState>) {
-      const fn = self.origReplaceState || nativeReplaceState.bind(history);
-      fn(...args);
-      try { self.handleNavigation(); } catch (e) { console.warn('SessionSight: error in replaceState handler', e); }
-    };
-  }
-
-  private unpatchHistoryMethods(): void {
-    if (this.origPushState) { history.pushState = this.origPushState; this.origPushState = null; }
-    if (this.origReplaceState) { history.replaceState = this.origReplaceState; this.origReplaceState = null; }
-  }
 
   private handleNavigation = (): void => {
     try {
@@ -3020,7 +3051,7 @@ export class Recorder {
   private collectMetadata(): SessionMetadata {
     return {
       url: stripUrlQuery(window.location.href),
-      referrer: stripUrlQuery(document.referrer || ''),
+      referrer: stripUrlQuery(externalReferrer(document.referrer || '') ?? ''),
       userAgent: navigator.userAgent,
       screenWidth: window.innerWidth,
       screenHeight: window.innerHeight,

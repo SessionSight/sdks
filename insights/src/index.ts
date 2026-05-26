@@ -14,6 +14,8 @@ import {
   generateUUID,
   getStoredVisitorToken,
   clearVisitorToken,
+  bootstrapVisitorToken,
+  writeVisitorId,
   containsProhibitedPII,
   isValidEmail,
   shouldSuppressPersistentId,
@@ -158,6 +160,27 @@ let connectionConfig: { apiUrl: string; apiKey: string; propertyId: string; auto
 let storedVisitorId: string = '';
 let storedSessionId: string = '';
 let goalsConfig: { apiUrl: string; apiKey: string; propertyId: string } | null = null;
+/**
+ * Resolves once an HMAC-signed visitor token is available on the main
+ * thread (in storage). `fireGoal` and split-test exposure paths require
+ * a valid token now that the server gates on `requireValidVisitorToken`;
+ * any session-attributed write fired before this promise resolves would
+ * 401. Set at `applyConsentGranted` time and cleared on teardown.
+ */
+let visitorReadyPromise: Promise<void> | null = null;
+/**
+ * Queue of goal calls fired before `visitorReadyPromise` resolved. The
+ * queue drains in order once the token lands; entries fire via
+ * sendBeacon at drain time. The queued goals return `{ success: true }`
+ * to the caller because the SDK guarantees best-effort delivery (same
+ * contract sendBeacon already offers).
+ */
+const pendingGoalCalls: Array<{
+  action: 'increment' | 'decrement';
+  goalId: string;
+  options: GoalOptions;
+  sessionId: string;
+}> = [];
 let quotaExceeded = false;
 /**
  * Set once a transport reports a terminal kill (invalid API key, revoked
@@ -208,6 +231,49 @@ function coerceLevel(v: ConsentLevel | boolean): ConsentLevel {
 
 // ── Goal fires ───────────────────────────────────────────────────────
 
+/**
+ * Send a goal call via sendBeacon. Assumes the visitor token is present
+ * in storage; the caller is responsible for either confirming that or
+ * queueing the call to drain after bootstrap completes.
+ */
+function sendGoalBeacon(
+  action: 'increment' | 'decrement',
+  goalId: string,
+  sessionId: string,
+  options: GoalOptions | undefined,
+): { sent: boolean; error?: string } {
+  if (!goalsConfig) return { sent: false, error: 'SessionSight not initialized' };
+  const { apiUrl, apiKey, propertyId } = goalsConfig;
+  const storedToken = getStoredVisitorToken();
+  const enrichedOptions: GoalPayloadOptions = {
+    ...options,
+    apiKey,
+    sessionId,
+    // visitorId rides every full-tier payload now that the server gates
+    // on it. The token plus the id together are the verification pair.
+    ...(storedVisitorId ? { visitorId: storedVisitorId } : {}),
+    ...(storedToken ? { visitorToken: storedToken } : {}),
+  };
+  const { body } = buildGoalPayload(goalId, propertyId, enrichedOptions);
+  const url = `${apiUrl}/v1/sdk/goals/${action}`;
+  const payload = JSON.stringify(body);
+  try {
+    const sent = navigator.sendBeacon(url, new Blob([payload], { type: 'application/json' }));
+    return { sent };
+  } catch (err) {
+    return { sent: false, error: err instanceof Error ? err.message : 'sendBeacon failed' };
+  }
+}
+
+/** Drain queued goal calls after visitorReadyPromise resolved. */
+function drainPendingGoalCalls(): void {
+  if (pendingGoalCalls.length === 0) return;
+  const drained = pendingGoalCalls.splice(0);
+  for (const entry of drained) {
+    sendGoalBeacon(entry.action, entry.goalId, entry.sessionId, entry.options);
+  }
+}
+
 function fireGoal(action: 'increment' | 'decrement', goalId: string, options?: GoalOptions): GoalResult {
   if (!goalsConfig) return { success: false, error: 'SessionSight not initialized' };
 
@@ -230,25 +296,24 @@ function fireGoal(action: 'increment' | 'decrement', goalId: string, options?: G
   const sessionIdForFire = options?.sessionId || storedSessionId;
   if (!sessionIdForFire) return { success: false, error: 'no session (consent required)' };
 
-  const { apiUrl, apiKey, propertyId } = goalsConfig;
-
+  // The server now hard-rejects full-tier goal writes without a valid
+  // visitor token. If we don't have one yet, queue the call and drain
+  // it once the bootstrap promise resolves. The queued call still
+  // reports success to the caller because we guarantee best-effort
+  // delivery (sendBeacon already gives the same contract).
   const storedToken = getStoredVisitorToken();
-  const enrichedOptions: GoalPayloadOptions = {
-    ...options,
-    apiKey,
-    sessionId: sessionIdForFire,
-    ...(storedToken ? { visitorToken: storedToken } : {}),
-  };
-
-  const { body } = buildGoalPayload(goalId, propertyId, enrichedOptions);
-  const url = `${apiUrl}/v1/sdk/goals/${action}`;
-  const payload = JSON.stringify(body);
-  try {
-    const sent = navigator.sendBeacon(url, new Blob([payload], { type: 'application/json' }));
-    return { success: sent };
-  } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : 'sendBeacon failed' };
+  if (!storedToken && visitorReadyPromise) {
+    pendingGoalCalls.push({
+      action,
+      goalId,
+      sessionId: sessionIdForFire,
+      options: options ?? {},
+    });
+    return { success: true };
   }
+
+  const { sent, error } = sendGoalBeacon(action, goalId, sessionIdForFire, options);
+  return error ? { success: false, error } : { success: sent };
 }
 
 // ── Privacy config cache ─────────────────────────────────────────────
@@ -510,6 +575,42 @@ function applyConsentGranted(): void {
   writeSessionCookie(sessionId);
   goalsConfig = { apiUrl, apiKey, propertyId };
 
+  // Eagerly bootstrap the visitor token on the main thread if one isn't
+  // already cached. The worker eventually mints a token via its own
+  // recovery path (after the first ingest 401), but goal increments
+  // fired before that round-trip would 401 against the now-strict
+  // requireValidVisitorToken middleware. Queued goal calls in
+  // pendingGoalCalls drain off this promise.
+  if (!getStoredVisitorToken()) {
+    visitorReadyPromise = bootstrapVisitorToken({
+      apiUrl,
+      publicApiKey: apiKey,
+      propertyId,
+      clientVisitorId: storedVisitorId,
+    })
+      .then((result) => {
+        // Server may have remapped to a different visitorId (claimed by
+        // another browser). Mirror the swap into module state and the
+        // persistent cookie so subsequent writes (and the worker, when
+        // it bootstraps for itself) all agree on one id.
+        if (result.visitorId !== storedVisitorId) {
+          storedVisitorId = result.visitorId;
+          writeVisitorId(result.visitorId);
+        }
+      })
+      .catch(() => {
+        // Best-effort. The worker's own recovery path is the canonical
+        // safety net; this eager bootstrap just narrows the race window.
+      })
+      .finally(() => {
+        drainPendingGoalCalls();
+      });
+  } else {
+    // Token already cached. No queue is possible because the storedToken
+    // check in fireGoal would have passed.
+    visitorReadyPromise = Promise.resolve();
+  }
+
   const bridge = new WorkerBridge(apiUrl, apiKey, propertyId, sessionId, storedVisitorId);
 
   bridge.onPrivacy((serverConfig) => {
@@ -582,6 +683,10 @@ function teardownFull(): void {
   goalsConfig = connectionConfig
     ? { apiUrl: connectionConfig.apiUrl, apiKey: connectionConfig.apiKey, propertyId: connectionConfig.propertyId }
     : null;
+  // Drop any pending goal queue + the visitor-ready promise; subsequent
+  // full-tier resumes mint a fresh visitor and rebuild both.
+  visitorReadyPromise = null;
+  pendingGoalCalls.length = 0;
 
   lastInitConfig = null;
   awaitingRotateResurrection = false;

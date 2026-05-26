@@ -256,6 +256,24 @@ export function stripUrlQuery(input: string): string {
 }
 
 /**
+ * Strip PII and URL query/fragment from an error message or stack trace.
+ *
+ * Routes through `redactString` for the full PII matrix (emails, phones,
+ * credit cards, SSNs, IBANs, JWTs, API keys, etc.) and then strips
+ * query/fragment from any embedded http(s) URLs so OAuth implicit-flow
+ * tokens (`#access_token=...`) and reset-link tokens never reach the
+ * server.
+ *
+ * Both SDK tiers share this exact function so the dedup gate downstream
+ * sees identical post-sanitize text for the same logical error. If the
+ * two tiers sanitized differently, the same thrown Error could dedupe in
+ * one tier and emit twice in the other.
+ */
+export function sanitizeErrorText(str: string): string {
+  return redactString(str || '').replace(/(https?:\/\/[^\s?#]+)[?#][^\s)"]*/g, '$1');
+}
+
+/**
  * Returns true if the input contains any prohibited-PII pattern: everything
  * redactString catches except email. Email is explicitly allowed because it
  * is the canonical stable identifier integrators reach for.

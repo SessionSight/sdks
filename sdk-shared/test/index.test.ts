@@ -9,6 +9,13 @@ import {
   bootstrapVisitorToken,
   fetchWithTimeout,
   hasLocalStorage,
+  externalReferrer,
+  externalReferrerHost,
+  globToRegex,
+  matchesAnyPattern,
+  sanitizeErrorText,
+  ERROR_DEDUP_WINDOW_MS,
+  patchHistoryMethods,
 } from '../src/index.js';
 
 // ── normalizeApiUrl ────────────────────────────────────────────────
@@ -350,5 +357,193 @@ describe('hasLocalStorage', () => {
     // In the Bun test environment without the localStorage shim, the
     // function safely returns false.
     expect(typeof hasLocalStorage()).toBe('boolean');
+  });
+});
+
+// ── externalReferrer / externalReferrerHost ────────────────────────
+//
+// Both helpers gate referrer capture in the SDK. The same-origin filter is
+// the bit that previously lived in two places (identified vs anonymous
+// capture). These tests pin the contract so the two callers cannot drift.
+
+describe('externalReferrer', () => {
+  let origLocation: any;
+
+  beforeEach(() => {
+    origLocation = (globalThis as any).location;
+  });
+
+  afterEach(() => {
+    if (origLocation === undefined) delete (globalThis as any).location;
+    else (globalThis as any).location = origLocation;
+  });
+
+  test('returns null for empty string', () => {
+    expect(externalReferrer('')).toBeNull();
+  });
+
+  test('returns null for malformed URLs', () => {
+    expect(externalReferrer('not a url')).toBeNull();
+  });
+
+  test('returns the input for an external referrer', () => {
+    (globalThis as any).location = { host: 'example.com' };
+    expect(externalReferrer('https://news.ycombinator.com/item?id=1')).toBe(
+      'https://news.ycombinator.com/item?id=1',
+    );
+  });
+
+  test('returns null when host matches location.host (same-origin)', () => {
+    (globalThis as any).location = { host: 'example.com' };
+    expect(externalReferrer('https://example.com/pricing')).toBeNull();
+  });
+
+  test('treats different ports as different hosts', () => {
+    // URL.host includes the port, so example.com:3000 vs example.com:4000
+    // are distinct. The current tier definition is "host," not "hostname";
+    // changing that contract is intentional, not incidental.
+    (globalThis as any).location = { host: 'example.com:3000' };
+    expect(externalReferrer('https://example.com:4000/page')).toBe(
+      'https://example.com:4000/page',
+    );
+  });
+
+  test('returns the input when location is undefined (SSR)', () => {
+    delete (globalThis as any).location;
+    expect(externalReferrer('https://example.com/page')).toBe(
+      'https://example.com/page',
+    );
+  });
+});
+
+describe('externalReferrerHost', () => {
+  let origLocation: any;
+
+  beforeEach(() => {
+    origLocation = (globalThis as any).location;
+  });
+
+  afterEach(() => {
+    if (origLocation === undefined) delete (globalThis as any).location;
+    else (globalThis as any).location = origLocation;
+  });
+
+  test('extracts host from an external referrer', () => {
+    (globalThis as any).location = { host: 'example.com' };
+    expect(externalReferrerHost('https://news.ycombinator.com/item?id=1'))
+      .toBe('news.ycombinator.com');
+  });
+
+  test('returns null for same-origin referrer', () => {
+    (globalThis as any).location = { host: 'example.com' };
+    expect(externalReferrerHost('https://example.com/pricing')).toBeNull();
+  });
+
+  test('returns null for empty / malformed input', () => {
+    expect(externalReferrerHost('')).toBeNull();
+    expect(externalReferrerHost('not a url')).toBeNull();
+  });
+});
+
+// ── globToRegex / matchesAnyPattern ────────────────────────────────
+//
+// These back the `excludePages` matcher used by both SDK tiers. The
+// contract is the one documented in dev-docs/sdk-privacy.md: `*` is the
+// only wildcard, bare patterns are exact-match. The anonymous-tier
+// `matchExcludePattern` previously diverged by also treating bare
+// patterns as directory prefixes; these tests pin the unified contract.
+
+describe('globToRegex', () => {
+  test('bare pattern is exact-match — no directory prefix', () => {
+    const re = globToRegex('/checkout')!;
+    expect(re.test('/checkout')).toBe(true);
+    expect(re.test('/checkout/payment')).toBe(false);
+    expect(re.test('/checkout-other')).toBe(false);
+  });
+
+  test('trailing star matches any suffix, including paths', () => {
+    const re = globToRegex('/admin*')!;
+    expect(re.test('/admin')).toBe(true);
+    expect(re.test('/admin/users')).toBe(true);
+    expect(re.test('/admin/users/42')).toBe(true);
+    expect(re.test('/other')).toBe(false);
+  });
+
+  test('mid-pattern star matches across slashes', () => {
+    const re = globToRegex('/account/*/settings')!;
+    expect(re.test('/account/abc/settings')).toBe(true);
+    expect(re.test('/account/abc/def/settings')).toBe(true);
+    expect(re.test('/account/settings')).toBe(false);
+  });
+
+  test('escapes other regex metacharacters', () => {
+    const re = globToRegex('/path.with+special(chars)')!;
+    expect(re.test('/path.with+special(chars)')).toBe(true);
+    expect(re.test('/pathXwithXspecialXcharsX')).toBe(false);
+  });
+
+  test('returns a value for any string input (RegExp constructor is permissive on these inputs)', () => {
+    // The current escape list covers every regex special char that could
+    // make RegExp throw — so in practice globToRegex always succeeds.
+    // The null branch exists for defense; this test pins that the
+    // documented inputs from sdk-privacy.md all compile.
+    expect(globToRegex('/checkout/*')).not.toBeNull();
+    expect(globToRegex('/account/*/settings')).not.toBeNull();
+    expect(globToRegex('/admin/*')).not.toBeNull();
+  });
+});
+
+describe('matchesAnyPattern', () => {
+  test('true when path matches any regex in the list', () => {
+    const patterns = [globToRegex('/admin*')!, globToRegex('/checkout/*')!];
+    expect(matchesAnyPattern('/admin/users', patterns)).toBe(true);
+    expect(matchesAnyPattern('/checkout/payment', patterns)).toBe(true);
+  });
+
+  test('false when path matches nothing', () => {
+    const patterns = [globToRegex('/admin*')!];
+    expect(matchesAnyPattern('/pricing', patterns)).toBe(false);
+  });
+
+  test('empty pattern list is never a match', () => {
+    expect(matchesAnyPattern('/anything', [])).toBe(false);
+  });
+});
+
+// ── sanitizeErrorText ──────────────────────────────────────────────
+//
+// Both SDK tiers funnel error messages through this. Dedup is computed on
+// the output, so any drift in this function would cause same-error counts
+// to diverge between the identified and anonymous tiers.
+
+describe('sanitizeErrorText', () => {
+  test('strips query string from embedded URLs', () => {
+    const out = sanitizeErrorText('failed loading https://example.com/api?token=secret');
+    expect(out).toBe('failed loading https://example.com/api');
+  });
+
+  test('strips fragment from embedded URLs (OAuth implicit flow)', () => {
+    const out = sanitizeErrorText('redirect https://example.com/cb#access_token=abc');
+    expect(out).toBe('redirect https://example.com/cb');
+  });
+
+  test('redacts PII via redactString', () => {
+    const out = sanitizeErrorText('User a@b.com hit a bug');
+    expect(out).not.toContain('a@b.com');
+  });
+
+  test('handles empty / null-ish input safely', () => {
+    expect(sanitizeErrorText('')).toBe('');
+    // The recorder used to pass raw `data.stack` (a string) but anonymous
+    // tier was already passing `|| ''`. The shared impl guards both.
+    expect(sanitizeErrorText(undefined as unknown as string)).toBe('');
+  });
+});
+
+describe('ERROR_DEDUP_WINDOW_MS', () => {
+  test('is a positive finite number', () => {
+    expect(typeof ERROR_DEDUP_WINDOW_MS).toBe('number');
+    expect(Number.isFinite(ERROR_DEDUP_WINDOW_MS)).toBe(true);
+    expect(ERROR_DEDUP_WINDOW_MS).toBeGreaterThan(0);
   });
 });

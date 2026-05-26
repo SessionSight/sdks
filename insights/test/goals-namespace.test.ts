@@ -21,10 +21,22 @@ const origLocation = (globalThis as any).location;
 
 const beaconCalls: Array<{ url: string; body: any }> = [];
 
+// A schema-valid token shape. The SDK only checks length + regex, not the
+// signature, before treating it as a stored token; signature verification
+// happens server-side. Tests that need to hit the eager-bootstrap path
+// can override this default.
+const PREBOOTSTRAPPED_TOKEN = 'v1.' + 'a'.repeat(40) + '.' + 'b'.repeat(20);
+
 beforeEach(() => {
   listeners.clear();
   beaconCalls.length = 0;
 
+  // Seed the visitor-token cookie up front. The SDK now requires a valid
+  // token to send full-tier goal beacons (server gates on it via the
+  // new requireValidVisitorToken middleware). Without this, every goal
+  // call would be queued behind the eager-bootstrap promise and never
+  // hit sendBeacon in these tests.
+  let docCookie = `ss_vtoken=${PREBOOTSTRAPPED_TOKEN}`;
   (globalThis as any).document = {
     get visibilityState() { return 'visible'; },
     addEventListener,
@@ -32,7 +44,20 @@ beforeEach(() => {
     querySelectorAll: () => [],
     querySelector: () => null,
     body: { appendChild: () => {}, removeChild: () => {} },
-    cookie: '',
+    get cookie() { return docCookie; },
+    set cookie(v: string) {
+      // Mirror real document.cookie write semantics: each `=` write
+      // either adds/replaces the matching name or expires it via
+      // max-age=0.
+      const match = /^([^=]+)=([^;]*)/.exec(v);
+      if (!match) return;
+      const name = match[1]!;
+      const value = match[2] ?? '';
+      const isExpire = /max-age=0|expires=Thu, 01 Jan 1970/.test(v);
+      const parts = docCookie.split('; ').filter((c) => !c.startsWith(`${name}=`));
+      if (!isExpire && value.length > 0) parts.push(`${name}=${value}`);
+      docCookie = parts.filter(Boolean).join('; ');
+    },
     createElement: (tag: string) => ({ tagName: tag.toUpperCase(), style: {}, setAttribute: () => {}, getAttribute: () => null, appendChild: () => {} }),
   };
 
@@ -179,7 +204,7 @@ describe('SessionSight.goals namespace', () => {
     expect(beaconCalls[0]!.url).toBe('https://api.example.com/v1/sdk/goals/decrement');
   });
 
-  test('beacon payload auto-attaches sessionId, apiKey, propertyId (no visitorId)', async () => {
+  test('beacon payload auto-attaches sessionId, apiKey, propertyId, visitorId, visitorToken', async () => {
     const SessionSight = await freshSessionSight();
     SessionSight.init({ publicApiKey: 'pk_test', propertyId: 'prop-1', apiUrl: 'https://api.example.com' });
 
@@ -195,8 +220,11 @@ describe('SessionSight.goals namespace', () => {
     expect(body.metadata).toEqual({ plan: 'pro' });
     expect(typeof body.sessionId).toBe('string');
     expect(body.sessionId.length).toBeGreaterThan(0);
-    // Under the session-as-identity model, visitorId is never on the wire.
-    expect(body.visitorId).toBeUndefined();
+    // visitorId + visitorToken now ride every full-tier goal payload —
+    // they're the verification pair the server gates on.
+    expect(typeof body.visitorId).toBe('string');
+    expect(body.visitorId.length).toBeGreaterThan(0);
+    expect(body.visitorToken).toBe(PREBOOTSTRAPPED_TOKEN);
   });
 
   test('rejects empty goalId with validation error', async () => {

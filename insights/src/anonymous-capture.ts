@@ -25,6 +25,12 @@ import {
   stripUrlQuery,
   redactString,
   classifyDevice,
+  externalReferrerHost,
+  sanitizeErrorText,
+  globToRegex,
+  matchesAnyPattern,
+  patchHistoryMethods,
+  ERROR_DEDUP_WINDOW_MS,
   type DeviceClass,
 } from '@sessionsight/sdk-shared';
 import type { PrivacyConfig } from './types.js';
@@ -153,7 +159,6 @@ export type AnonymousEvent =
 const CLICK_BUCKET_PX = 10;
 const FORM_RETRY_WINDOW_MS = 30_000;
 const FORM_RETRY_THRESHOLD = 3;
-const ERROR_DEDUP_WINDOW_MS = 1_000;
 const INPUT_SELECTOR = 'input, textarea, select';
 const FORM_CONTAINER_SELECTOR = 'form, [data-ss-form]';
 
@@ -210,16 +215,21 @@ export class AnonymousCapture {
   private boundPopState = () => this.handleNavigation();
 
   // History API patches (popstate alone doesn't catch pushState).
-  private originalPushState: typeof history.pushState | null = null;
-  private originalReplaceState: typeof history.replaceState | null = null;
+  private unpatchHistoryFn: (() => void) | null = null;
 
   // Last error dedup (mirrors recorder).
   private lastErrorMessage = '';
   private lastErrorTime = 0;
 
+  // Pre-compiled excludePages patterns. Compiled once at construction
+  // and on every applyPrivacyConfig so the per-event hot path doesn't
+  // re-parse the same strings on every gate check.
+  private excludePagePatterns: RegExp[] = [];
+
   constructor(config: AnonymousCaptureConfig) {
     this.sink = config.sink;
     this.privacyConfig = config.privacyConfig;
+    this.excludePagePatterns = (config.privacyConfig.excludePages ?? []).map(globToRegex).filter((r): r is RegExp => r !== null);
   }
 
   // ── Lifecycle ─────────────────────────────────────────────────────
@@ -241,7 +251,11 @@ export class AnonymousCapture {
     window.addEventListener('popstate', this.boundPopState);
     window.addEventListener('beforeunload', this.boundVisibility);
 
-    this.patchHistory();
+    // Mirror the recorder's idempotency guard even though `start()`'s
+    // `if (this.started) return;` upstream is already a sufficient defense.
+    // Keeping the shape identical to recorder so future cross-tier review
+    // doesn't have to reason about the asymmetry.
+    if (!this.unpatchHistoryFn) this.unpatchHistoryFn = patchHistoryMethods(() => this.handleNavigation());
 
     // Emit the first pageview synchronously so first-load traffic is counted
     // even on pages with very short visits.
@@ -275,11 +289,12 @@ export class AnonymousCapture {
     window.removeEventListener('popstate', this.boundPopState);
     window.removeEventListener('beforeunload', this.boundVisibility);
 
-    this.unpatchHistory();
+    if (this.unpatchHistoryFn) { this.unpatchHistoryFn(); this.unpatchHistoryFn = null; }
   }
 
   applyPrivacyConfig(config: PrivacyConfig): void {
     this.privacyConfig = config;
+    this.excludePagePatterns = (config.excludePages ?? []).map(globToRegex).filter((r): r is RegExp => r !== null);
   }
 
   /**
@@ -296,13 +311,9 @@ export class AnonymousCapture {
   // ── Page exclusion gate ───────────────────────────────────────────
 
   private isExcludedPage(): boolean {
+    if (this.excludePagePatterns.length === 0) return false;
     const path = stripUrlQuery(window.location.pathname);
-    const patterns = this.privacyConfig.excludePages || [];
-    for (const pattern of patterns) {
-      if (!pattern) continue;
-      if (matchExcludePattern(path, pattern)) return true;
-    }
-    return false;
+    return matchesAnyPattern(path, this.excludePagePatterns);
   }
 
   // ── Pageview ──────────────────────────────────────────────────────
@@ -311,7 +322,7 @@ export class AnonymousCapture {
     if (this.isExcludedPage()) return;
     const path = stripUrlQuery(window.location.pathname);
     const referrer = document.referrer || '';
-    const referrerHost = parseReferrerHost(referrer);
+    const referrerHost = externalReferrerHost(referrer);
     const deviceClass = classifyDevice(navigator.userAgent || '', window.innerWidth || 0);
     const lang = (navigator.language || '').slice(0, 16);
 
@@ -349,34 +360,6 @@ export class AnonymousCapture {
     // page-keyed component of formId means we don't actively re-trigger.
     this.rageClickTimestamps = [];
     this.emitPageview();
-  }
-
-  private patchHistory(): void {
-    if (this.originalPushState) return;
-    this.originalPushState = history.pushState;
-    this.originalReplaceState = history.replaceState;
-    const self = this;
-    history.pushState = function (this: History, ...args: Parameters<History['pushState']>) {
-      const ret = self.originalPushState!.apply(this, args);
-      try { self.handleNavigation(); } catch {}
-      return ret;
-    };
-    history.replaceState = function (this: History, ...args: Parameters<History['replaceState']>) {
-      const ret = self.originalReplaceState!.apply(this, args);
-      try { self.handleNavigation(); } catch {}
-      return ret;
-    };
-  }
-
-  private unpatchHistory(): void {
-    if (this.originalPushState) {
-      history.pushState = this.originalPushState;
-      this.originalPushState = null;
-    }
-    if (this.originalReplaceState) {
-      history.replaceState = this.originalReplaceState;
-      this.originalReplaceState = null;
-    }
   }
 
   // ── Click → aggregate_click + rage-click rollup ──────────────────
@@ -576,10 +559,6 @@ export class AnonymousCapture {
 
   // ── Error capture (already sanitized at the SDK) ─────────────────
 
-  private sanitizeErrorText(str: string): string {
-    return redactString(str || '').replace(/(https?:\/\/[^\s?#]+)[?#][^\s)"]*/g, '$1');
-  }
-
   private emitErrorEvent(data: {
     message: string;
     stack: string;
@@ -590,7 +569,7 @@ export class AnonymousCapture {
   }): void {
     if (this.isExcludedPage()) return;
     const now = Date.now();
-    const sanitizedMessage = this.sanitizeErrorText(data.message);
+    const sanitizedMessage = sanitizeErrorText(data.message);
     if (sanitizedMessage === this.lastErrorMessage && now - this.lastErrorTime < ERROR_DEDUP_WINDOW_MS) {
       return;
     }
@@ -599,7 +578,7 @@ export class AnonymousCapture {
     this.sink({
       tag: 'error',
       message: sanitizedMessage,
-      stack: this.sanitizeErrorText(data.stack),
+      stack: sanitizeErrorText(data.stack),
       source: stripUrlQuery(data.source || ''),
       lineno: data.lineno || 0,
       colno: data.colno || 0,
@@ -653,40 +632,9 @@ export class AnonymousCapture {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-function parseReferrerHost(ref: string): string | null {
-  if (!ref) return null;
-  try {
-    const url = new URL(ref);
-    // If referrer is the same origin, don't leak it. The dashboard derives
-    // "internal" navigations from same-host pageviews; saving them as
-    // referrers double-counts and pollutes top-referrer rankings.
-    if (typeof location !== 'undefined' && url.host === location.host) return null;
-    return url.host || null;
-  } catch {
-    return null;
-  }
-}
-
 function isPasswordField(el: HTMLInputElement): boolean {
   if (!el) return false;
   if (el.tagName !== 'INPUT') return false;
   return (el.type || '').toLowerCase() === 'password';
 }
 
-/**
- * Match a request path against an exclusion pattern. Mirrors the matcher
- * used by Recorder. Patterns are simple prefixes, with optional `*` wildcard.
- */
-function matchExcludePattern(path: string, pattern: string): boolean {
-  if (!pattern || !path) return false;
-  if (pattern === path) return true;
-  if (pattern.endsWith('*')) {
-    const prefix = pattern.slice(0, -1);
-    return path.startsWith(prefix);
-  }
-  // Treat a non-wildcard pattern as an exact match OR a directory prefix
-  // (`/checkout` excludes `/checkout` and `/checkout/...`).
-  if (path === pattern) return true;
-  if (path.startsWith(pattern + '/')) return true;
-  return false;
-}

@@ -1,6 +1,6 @@
 {
   "name": "@sessionsight/insights",
-  "version": "1.2.1",
+  "version": "1.3.0",
   "description": "Session replay, heatmaps, and user analytics SDK for SessionSight.",
   "author": "SessionSight",
   "license": "MIT",

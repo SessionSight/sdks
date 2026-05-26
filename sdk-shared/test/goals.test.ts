@@ -126,4 +126,21 @@ describe('buildGoalPayload', () => {
     });
     expect('metadata' in body).toBe(false);
   });
+
+  test('includes visitorToken and visitorId when supplied (server verification pair)', () => {
+    const { body } = buildGoalPayload('purchase', 'prop-1', {
+      apiKey: 'pk_123',
+      sessionId: 'sid',
+      visitorId: 'v-abc',
+      visitorToken: 'v1.aaaa.bbbb',
+    });
+    expect(body.visitorId).toBe('v-abc');
+    expect(body.visitorToken).toBe('v1.aaaa.bbbb');
+  });
+
+  test('omits visitorToken / visitorId when not supplied (anonymous / pre-bootstrap)', () => {
+    const { body } = buildGoalPayload('purchase', 'prop-1', { apiKey: 'pk_123', sessionId: 'sid' });
+    expect('visitorToken' in body).toBe(false);
+    expect('visitorId' in body).toBe(false);
+  });
 });

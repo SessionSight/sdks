@@ -239,8 +239,12 @@ test('exposed visitor stays bucketed even after config hashSeed changes', async 
 // ════════════════════════════════════════════════════════════════════
 
 test('only one POST per (sessionId, testKey) per instance, even after flush', async () => {
-  // Install a cookie store so the SDK has a session to key exposures to.
-  let cookieStore = 'ss_sid=sess-h3';
+  // Install a cookie store so the SDK has a session to key exposures to,
+  // plus a pre-bootstrapped visitor token so the expose flush takes the
+  // inline send path (the bootstrap fallback would be async and never
+  // complete in this test).
+  const VTOKEN = 'v1.' + 'a'.repeat(40) + '.' + 'b'.repeat(20);
+  let cookieStore = `ss_sid=sess-h3; ss_vtoken=${VTOKEN}`;
   Object.defineProperty(globalThis, 'document', {
     value: {
       createElement: () => ({ id: '', textContent: '', remove() {} }),

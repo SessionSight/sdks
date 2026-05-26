@@ -50,9 +50,15 @@ const fakeConfig: SplitTestConfigResponse = {
   ttl: 300,
 };
 
+// Schema-valid visitor-token shape. Server-side HMAC verification runs
+// in requireValidVisitorToken; the SDK only checks length/format before
+// treating a stored token as usable. Tests pre-seed this cookie so the
+// flush takes the inline-send path instead of waiting on bootstrap.
+const VTOKEN = 'v1.' + 'a'.repeat(40) + '.' + 'b'.repeat(20);
+
 describe('SplitTesting browser: reads ss_sid from cookie on exposure flush', () => {
   test('attaches sessionId from ss_sid cookie when flushing exposures', async () => {
-    installCookieStore('ss_sid=sess-browser-123');
+    installCookieStore(`ss_sid=sess-browser-123; ss_vtoken=${VTOKEN}`);
 
     const fetchMock = mock(async () => new Response(JSON.stringify(fakeConfig), { status: 200 }));
     globalThis.fetch = fetchMock as any;
@@ -122,7 +128,7 @@ describe('SplitTesting browser: reads ss_sid from cookie on exposure flush', () 
 
 describe('SplitTesting server: forRequest binds cookies from the request', () => {
   test('bound flush uses sessionId from the request', async () => {
-    installCookieStore('ss_sid=initial-sess'); // allow tracking so exposure gets queued
+    installCookieStore(`ss_sid=initial-sess; ss_vtoken=${VTOKEN}`); // allow tracking so exposure gets queued
 
     const fetchMock = mock(async () => new Response(JSON.stringify(fakeConfig), { status: 200 }));
     globalThis.fetch = fetchMock as any;

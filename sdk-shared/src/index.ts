@@ -6,6 +6,7 @@ export {
   redactString,
   containsProhibitedPII,
   stripUrlQuery,
+  sanitizeErrorText,
   REDACTED,
   luhnCheck,
   // Media stripping primitives (image, video, audio)
@@ -584,6 +585,7 @@ export interface GoalResult {
 export interface GoalPayloadOptions extends GoalOptions {
   apiKey?: string;
   visitorToken?: string;
+  visitorId?: string;
 }
 
 // ── Goal Validation & Payload ───────────────────────────────────────
@@ -608,6 +610,7 @@ export interface GoalPayloadBody {
   sessionId?: string;
   metadata?: Record<string, string>;
   visitorToken?: string;
+  visitorId?: string;
 }
 
 /**
@@ -652,8 +655,166 @@ export function buildGoalPayload(
       ...(options?.sessionId ? { sessionId: options.sessionId } : {}),
       ...(safeMetadata && Object.keys(safeMetadata).length > 0 ? { metadata: safeMetadata } : {}),
       ...(options?.visitorToken ? { visitorToken: options.visitorToken } : {}),
+      ...(options?.visitorId ? { visitorId: options.visitorId } : {}),
     },
   };
+}
+
+// ── excludePages pattern matching ───────────────────────────────────
+
+/**
+ * Compile an `excludePages` glob pattern into an anchored RegExp. `*` is
+ * the only wildcard, matching any number of characters (including `/`).
+ * All other regex metacharacters are escaped. Returns null when the
+ * compiled pattern is not a valid RegExp; the SDK logs the offending
+ * pattern so a misconfigured customer sees the warning in their console.
+ *
+ * Bare patterns are exact-match: `/checkout` does NOT match
+ * `/checkout/payment`. Customers who want a directory exclusion write
+ * `/checkout*` or `/checkout/*`. This is the contract documented in
+ * `dev-docs/sdk-privacy.md`. Both SDK tiers compile through this one
+ * function so the identified and anonymous tiers cannot exclude
+ * different sets of paths from the same configured pattern list.
+ */
+export function globToRegex(pattern: string): RegExp | null {
+  try {
+    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+    const regexStr = '^' + escaped.replace(/\*/g, '.*') + '$';
+    return new RegExp(regexStr);
+  } catch (e) {
+    console.warn('SessionSight: invalid excludePages pattern', pattern, e);
+    return null;
+  }
+}
+
+/**
+ * Returns true if `path` matches any of the pre-compiled patterns.
+ * Callers holding raw string patterns should compile once with
+ * `globToRegex` and reuse the result rather than recompiling per call.
+ */
+export function matchesAnyPattern(path: string, patterns: RegExp[]): boolean {
+  for (const regex of patterns) {
+    if (regex.test(path)) return true;
+  }
+  return false;
+}
+
+// ── History patching (SPA navigation detection) ────────────────────
+//
+// SPAs change the URL via `history.pushState` / `history.replaceState`,
+// neither of which fires `popstate`. To observe SPA navigation the SDK
+// monkey-patches both methods. Both tiers previously did this in their
+// own files with subtly different defensive postures (prototype fallback
+// vs apply-with-receiver vs no re-patch guard). All of them flow through
+// this one helper now.
+
+const historyNavSubscribers = new Set<() => void>();
+let historyPatchInstalled = false;
+
+function fireHistoryNavSubscribers(): void {
+  for (const cb of historyNavSubscribers) {
+    try { cb(); } catch (e) { console.warn('SessionSight: history navigation subscriber threw', e); }
+  }
+}
+
+function installHistoryPatch(): void {
+  if (historyPatchInstalled) return;
+  if (typeof history === 'undefined') return;
+  historyPatchInstalled = true;
+
+  const originalPushState = history.pushState.bind(history);
+  const originalReplaceState = history.replaceState.bind(history);
+
+  history.pushState = function (...args: Parameters<typeof history.pushState>) {
+    originalPushState(...args);
+    fireHistoryNavSubscribers();
+  };
+  history.replaceState = function (...args: Parameters<typeof history.replaceState>) {
+    originalReplaceState(...args);
+    fireHistoryNavSubscribers();
+  };
+}
+
+/**
+ * Subscribe to SPA navigation events driven by `history.pushState` and
+ * `history.replaceState`. Returns an unsubscribe function.
+ *
+ * The patch is installed exactly once per page load on first call. Later
+ * calls reuse the same wrapper, so multiple SDK tiers (or multiple SDK
+ * restarts) never layer wrappers on top of each other.
+ *
+ * Unsubscribe removes the callback from the subscriber set but does NOT
+ * restore the original `history.pushState` / `replaceState`. Restoration
+ * is unsafe: a third-party library that patched after we did has captured
+ * our wrapper as its "original," so rolling back to the pre-SessionSight
+ * functions would erase that library's patch from the chain. The wrapper
+ * with zero subscribers is a one-funcall pass-through, which costs
+ * nothing observable.
+ *
+ * Edge case: a caller doing `pushState.call(otherReceiver, ...)` will
+ * still execute the original against `history`, because the originals
+ * were bound at install time. No real-world code passes a custom
+ * receiver to `History` methods.
+ *
+ * SSR-safe: returns a no-op unsubscribe when `history` is undefined.
+ */
+export function patchHistoryMethods(onNavigate: () => void): () => void {
+  if (typeof history === 'undefined') return () => {};
+  installHistoryPatch();
+  historyNavSubscribers.add(onNavigate);
+  return () => { historyNavSubscribers.delete(onNavigate); };
+}
+
+// ── Error capture constants ─────────────────────────────────────────
+
+/**
+ * Dedup window for emitted error events. Two errors whose sanitized
+ * message is identical and which arrive within this window are
+ * collapsed to one emit. Both SDK tiers must dedupe on the
+ * *post-sanitize* string and use this same window so identical
+ * thrown errors produce identical event counts across tiers.
+ */
+export const ERROR_DEDUP_WINDOW_MS = 1_000;
+
+// ── Referrer classification ─────────────────────────────────────────
+
+/**
+ * Return the input referrer URL if it represents external acquisition, or
+ * null if it's empty, malformed, or same-origin as the current document.
+ *
+ * Same-origin referrers are internal navigation, not acquisition; shipping
+ * them pollutes top-referrer rankings on the dashboard. Both SDK tiers
+ * (identified `Recorder` and anonymous `AnonymousCapture`) gate referrer
+ * capture through this one helper so the rule cannot drift between them.
+ * If the definition changes (e.g. compare against an explicit property
+ * hostname rather than `location.host`), only this function moves.
+ *
+ * SSR-safe: returns the input unchanged when `location` is undefined.
+ */
+export function externalReferrer(ref: string): string | null {
+  if (!ref) return null;
+  try {
+    const url = new URL(ref);
+    if (typeof location !== 'undefined' && url.host === location.host) return null;
+    return ref;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Host-only convenience over `externalReferrer`. Anonymous-tier capture
+ * ships the host directly; identified-tier capture ships the full URL and
+ * the server derives host at aggregation. Both flow through the same gate.
+ */
+export function externalReferrerHost(ref: string): string | null {
+  const external = externalReferrer(ref);
+  if (!external) return null;
+  try {
+    return new URL(external).host || null;
+  } catch {
+    return null;
+  }
 }
 
 // ── Device classification ───────────────────────────────────────────
