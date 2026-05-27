@@ -1,6 +1,6 @@
 {
   "name": "@sessionsight/flags",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Feature flags SDK for SessionSight.",
   "author": "SessionSight",
   "license": "MIT",

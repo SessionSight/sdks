@@ -1,6 +1,6 @@
 {
   "name": "@sessionsight/goals",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Goal and conversion tracking SDK for SessionSight.",
   "author": "SessionSight",
   "license": "MIT",

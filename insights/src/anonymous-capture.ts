@@ -105,6 +105,7 @@ export interface AnonymousFieldBlurEvent {
 
 export interface AnonymousFormFieldRetryEvent {
   tag: 'form_field_retry';
+  formId: string;
   formName: string;
   fieldName: string;
   page: string;
@@ -486,7 +487,7 @@ export class AnonymousCapture {
       const recent = focusTimes.filter(t => t >= cutoff);
       this.fieldFocusCounts.set(focusKey, recent);
       if (recent.length >= FORM_RETRY_THRESHOLD) {
-        this.sink({ tag: 'form_field_retry', formName, fieldName: field.fieldName, page, retries: recent.length, ts: now });
+        this.sink({ tag: 'form_field_retry', formId, formName, fieldName: field.fieldName, page, retries: recent.length, ts: now });
         this.fieldFocusCounts.set(focusKey, []);
       }
     } catch {

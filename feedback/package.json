@@ -1,6 +1,6 @@
 {
   "name": "@sessionsight/feedback",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "User feedback and survey SDK for SessionSight.",
   "author": "SessionSight",
   "license": "MIT",

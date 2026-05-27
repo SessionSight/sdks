@@ -2004,33 +2004,107 @@ export class Recorder {
 
   private static readonly INPUT_SELECTOR = 'input:not([type="hidden"]):not([type="submit"]):not([type="button"]), textarea, select';
 
-  /** Find the nearest grouping container: <form>, [data-ss-form], or null (page-level). */
+  /**
+   * Find the grouping container for `target`: a real <form>, an explicit
+   * [data-ss-form], or — for inputs outside both — the nearest ancestor
+   * (within 4 levels) that holds ≥2 inputs. Returns null for truly stray
+   * inputs (a lone search box, a single filter field). The callers treat
+   * null as "skip this event" so we don't manufacture phantom page-level
+   * form rows from unrelated inputs scattered across the page.
+   */
   private getFormContainer(target: HTMLElement): HTMLElement | null {
-    return target.closest('form') || target.closest('[data-ss-form]');
+    return target.closest('form')
+      || target.closest('[data-ss-form]')
+      || this.findInputGroupAncestor(target);
   }
 
-  private getFormInfo(container: HTMLElement | null): { formId: string; formName: string } {
-    const page = stripUrlQuery(window.location.pathname);
-
-    if (!container) {
-      return { formId: `${page}:_page`, formName: page };
+  private findInputGroupAncestor(target: HTMLElement): HTMLElement | null {
+    let cur: HTMLElement | null = target.parentElement;
+    let depth = 0;
+    while (cur && depth < 4) {
+      if (cur.querySelectorAll(Recorder.INPUT_SELECTOR).length >= 2) return cur;
+      cur = cur.parentElement;
+      depth++;
     }
+    return null;
+  }
 
+  private getFormInfo(container: HTMLElement | null): { formId: string; formName: string } | null {
+    if (!container) return null;
+    const page = stripUrlQuery(window.location.pathname);
     const containerId = container.id.slice(0, 100);
+    const dataName = container.getAttribute('data-ss-form')?.slice(0, 100);
+
     if (container.tagName === 'FORM') {
       const allForms = Array.from(document.querySelectorAll('form'));
       const index = allForms.indexOf(container as HTMLFormElement);
       const indexStr = index >= 0 ? String(index) : '0';
       const formId = `${page}:${containerId || indexStr}`;
-      const dataName = container.getAttribute('data-ss-form')?.slice(0, 100);
-      const formName = dataName || containerId || `Form ${index + 1}`;
+      const formAttrName = (container as HTMLFormElement).name?.slice(0, 100) || '';
+      const formName = dataName
+        || this.inferFormNameFromAria(container)
+        || formAttrName
+        || containerId
+        || this.inferFormNameFromSubmit(container, true)
+        || this.inferFormNameFromHeading(container)
+        || `Form ${index + 1}`;
       return { formId, formName };
     }
 
-    // [data-ss-form] container
-    const dataName = container.getAttribute('data-ss-form')!.slice(0, 100);
-    const formId = `${page}:${containerId || dataName}`;
-    return { formId, formName: dataName };
+    if (dataName) {
+      const formId = `${page}:${containerId || dataName}`;
+      return { formId, formName: dataName };
+    }
+
+    // Synthetic input-group (≥2 inputs in a shared ancestor, no <form> wrapper).
+    const ident = containerId || container.tagName.toLowerCase();
+    const formName = containerId
+      || this.inferFormNameFromAria(container)
+      || this.inferFormNameFromHeading(container)
+      || this.inferFormNameFromSubmit(container, false)
+      || `Inputs on ${page}`;
+    return { formId: `${page}:_g:${ident}`, formName };
+  }
+
+  /** aria-labelledby (resolved text) → aria-label. Returns null if neither present. */
+  private inferFormNameFromAria(container: HTMLElement): string | null {
+    const labelledBy = container.getAttribute('aria-labelledby');
+    if (labelledBy) {
+      const parts = labelledBy.split(/\s+/)
+        .filter(Boolean)
+        .map(id => document.getElementById(id)?.textContent?.trim())
+        .filter((t): t is string => !!t);
+      if (parts.length) return parts.join(' ').slice(0, 100);
+    }
+    const label = container.getAttribute('aria-label')?.trim();
+    return label ? label.slice(0, 100) : null;
+  }
+
+  /**
+   * Primary submit button text → `"<text> form"`. For real <form>s, an
+   * untyped <button> defaults to submit and counts; for synthetic containers
+   * we require explicit type="submit" to avoid latching onto a "Cancel"
+   * button that happens to sit inside the input group.
+   */
+  private inferFormNameFromSubmit(container: HTMLElement, allowUntyped: boolean): string | null {
+    const selector = allowUntyped
+      ? 'button[type="submit"], input[type="submit"], button:not([type])'
+      : 'button[type="submit"], input[type="submit"]';
+    const btn = container.querySelector(selector);
+    if (!btn) return null;
+    const raw = btn.tagName === 'INPUT'
+      ? (btn as HTMLInputElement).value
+      : (btn.textContent || '');
+    const text = raw.trim();
+    if (!text) return null;
+    return `${text.slice(0, 60)} form`.slice(0, 100);
+  }
+
+  /** Nearest <legend> or h1-h4 inside the container. */
+  private inferFormNameFromHeading(container: HTMLElement): string | null {
+    const heading = container.querySelector('legend, h1, h2, h3, h4');
+    const text = heading?.textContent?.trim();
+    return text ? text.slice(0, 100) : null;
   }
 
   private getFieldInfo(el: HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement, container: HTMLElement | null) {
@@ -2073,7 +2147,9 @@ export class Recorder {
       if (!target.matches(Recorder.INPUT_SELECTOR)) return;
 
       const container = this.getFormContainer(target);
-      const { formId, formName } = this.getFormInfo(container);
+      const info = this.getFormInfo(container);
+      if (!info) return;
+      const { formId, formName } = info;
       const field = this.getFieldInfo(target as HTMLInputElement, container);
       const page = stripUrlQuery(window.location.pathname);
 
@@ -2099,7 +2175,7 @@ export class Recorder {
       const recent = focusTimes.filter(t => t >= retryCutoff);
       this.fieldFocusCounts.set(focusKey, recent);
       if (recent.length >= 3) {
-        this.emitCustomEvent('form_field_retry', { formName, fieldName: field.fieldName, page, retries: recent.length });
+        this.emitCustomEvent('form_field_retry', { formId, formName, fieldName: field.fieldName, page, retries: recent.length });
         this.fieldFocusCounts.set(focusKey, []);
       }
 
@@ -2117,7 +2193,9 @@ export class Recorder {
       if (!target.matches(Recorder.INPUT_SELECTOR)) return;
 
       const container = this.getFormContainer(target);
-      const { formId, formName } = this.getFormInfo(container);
+      const info = this.getFormInfo(container);
+      if (!info) return;
+      const { formId, formName } = info;
       const field = this.getFieldInfo(target as HTMLInputElement, container);
       const page = stripUrlQuery(window.location.pathname);
 
@@ -2172,7 +2250,9 @@ export class Recorder {
     try {
       const form = e.target as HTMLFormElement;
       if (!form || form.tagName !== 'FORM') return;
-      const { formId, formName } = this.getFormInfo(form);
+      const info = this.getFormInfo(form);
+      if (!info) return;
+      const { formId, formName } = info;
       const page = stripUrlQuery(window.location.pathname);
       const inputs = form.querySelectorAll(Recorder.INPUT_SELECTOR);
       const filledFields = Array.from(inputs).filter((input) => {
