@@ -2591,6 +2591,29 @@ export class Recorder {
         }
       } catch {}
 
+      // Target metadata for the frustration-category classifier. Read
+      // defensively because `el` may be the original event target rather
+      // than an HTMLElement subclass with these properties.
+      const targetMeta = (() => {
+        if (!el) return undefined;
+        const role = el.getAttribute?.('role') || undefined;
+        const inputType = (el as HTMLInputElement)?.type;
+        const ariaDisabled = el.getAttribute?.('aria-disabled') === 'true';
+        const propDisabled = (el as HTMLButtonElement | HTMLInputElement)?.disabled === true;
+        const inForm = !!el.closest?.('form');
+        const rawClass = typeof (el as HTMLElement).className === 'string'
+          ? (el as HTMLElement).className
+          : '';
+        const className = rawClass ? rawClass.slice(0, 100) : undefined;
+        const meta: Record<string, any> = {};
+        if (role) meta.role = role;
+        if (inputType) meta.type = inputType;
+        if (propDisabled || ariaDisabled) meta.disabled = true;
+        if (inForm) meta.inForm = true;
+        if (className) meta.className = className;
+        return Object.keys(meta).length > 0 ? meta : undefined;
+      })();
+
       const clickData: Record<string, any> = {
         // x/y/viewportX/viewportY are kept for diagnostics; the rollup
         // ignores them and buckets clicks by descriptor + elementOffset.
@@ -2605,6 +2628,7 @@ export class Recorder {
         elementHref: href,
         isInteractive: true,
       };
+      if (targetMeta) clickData.target = targetMeta;
       if (descriptor) {
         clickData.descriptor = descriptor;
         if (elementOffset) clickData.elementOffset = elementOffset;
@@ -2621,8 +2645,16 @@ export class Recorder {
       // Reset idle timer on click
       this.resetIdleTimer();
 
-      // Rage click detection: check if 3+ clicks landed within 1s and 30px radius
-      this.checkRageClick(e.clientX, e.clientY);
+      // Rage click detection: check if 3+ clicks landed within 1s and 30px radius.
+      // Pass the click's element context so the rage_click event carries the
+      // same target metadata the frustration-category classifier reads.
+      this.checkRageClick(e.clientX, e.clientY, {
+        elementTag: tagName,
+        elementText: text,
+        elementHref: href,
+        isInteractive,
+        target: targetMeta,
+      });
     } catch (e2) {
       console.warn('SessionSight: error in heatmap click handler', e2);
     }
@@ -2754,8 +2786,25 @@ export class Recorder {
   /**
    * Check for rage clicks: 3+ clicks within 1s and 30px radius.
    * Maintains a circular buffer of recent clicks (max 5).
+   *
+   * The triggering click's element context (`triggerCtx`) is attached to
+   * the emitted rage_click event so the API classifier can bucket the
+   * cluster into a category (form-field, disabled, button, etc.). The
+   * triggering click is the cluster centroid by construction (the last
+   * click that pushed `nearby` over the threshold), which is good enough
+   * as a representative element.
    */
-  private checkRageClick(x: number, y: number): void {
+  private checkRageClick(
+    x: number,
+    y: number,
+    triggerCtx?: {
+      elementTag?: string;
+      elementText?: string;
+      elementHref?: string;
+      isInteractive?: boolean;
+      target?: Record<string, any>;
+    },
+  ): void {
     const now = Date.now();
     this.recentClicks.push({ x, y, t: now });
     if (this.recentClicks.length > 5) this.recentClicks.shift();
@@ -2773,12 +2822,18 @@ export class Recorder {
     }
 
     if (nearby >= Recorder.RAGE_CLICK_COUNT) {
-      this.emitCustomEvent('rage_click', {
+      const payload: Record<string, any> = {
         x,
         y,
         page: stripUrlQuery(window.location.pathname),
         clickCount: nearby,
-      });
+      };
+      if (triggerCtx?.elementTag) payload.elementTag = triggerCtx.elementTag;
+      if (triggerCtx?.elementText) payload.elementText = triggerCtx.elementText;
+      if (triggerCtx?.elementHref) payload.elementHref = triggerCtx.elementHref;
+      if (typeof triggerCtx?.isInteractive === 'boolean') payload.isInteractive = triggerCtx.isInteractive;
+      if (triggerCtx?.target) payload.target = triggerCtx.target;
+      this.emitCustomEvent('rage_click', payload);
       // Clear buffer to avoid re-firing on the next click
       this.recentClicks.length = 0;
     }
@@ -2945,6 +3000,7 @@ export class Recorder {
     lineno: number;
     colno: number;
     type: 'uncaught' | 'unhandled_rejection';
+    errorName?: string;
   }): void {
     const now = Date.now();
     // Dedupe on the *sanitized* message. Two thrown Errors that differ
@@ -2957,7 +3013,7 @@ export class Recorder {
     this.lastErrorMessage = sanitizedMessage;
     this.lastErrorTime = now;
 
-    this.emitCustomEvent('error', {
+    const payload: Record<string, any> = {
       message: sanitizedMessage,
       stack: sanitizeErrorText(data.stack),
       source: stripUrlQuery(data.source),
@@ -2965,7 +3021,9 @@ export class Recorder {
       colno: data.colno,
       type: data.type,
       page: stripUrlQuery(window.location.pathname),
-    });
+    };
+    if (data.errorName) payload.errorName = data.errorName;
+    this.emitCustomEvent('error', payload);
   }
 
   private handleWindowError = (e: ErrorEvent): void => {
@@ -2976,6 +3034,7 @@ export class Recorder {
       lineno: e.lineno || 0,
       colno: e.colno || 0,
       type: 'uncaught',
+      errorName: e.error?.name,
     });
   };
 
@@ -2990,6 +3049,7 @@ export class Recorder {
       lineno: 0,
       colno: 0,
       type: 'unhandled_rejection',
+      errorName: reason instanceof Error ? reason.name : undefined,
     });
   };
 
