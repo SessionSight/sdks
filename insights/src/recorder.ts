@@ -2394,6 +2394,75 @@ export class Recorder {
 
   private static readonly DEAD_CLICK_DEFER_MS = 400;
 
+  // Maximum pixel distance from the click point to a candidate leaf before we
+  // give up on "the user missed by a hair" refinement and accept the container
+  // as the click target. ~32px is roughly a thumb-tap miss.
+  private static readonly NEAREST_LEAF_MAX_DIST = 32;
+  // Hard cap on descendants we'll scan. Larger and we accept the container
+  // label rather than pay for a body-wide traversal on broken pages.
+  private static readonly NEAREST_LEAF_MAX_NODES = 400;
+
+  // True if `node` has a direct text-node child with non-empty text, or if
+  // it's itself interactive. Direct text only (not deep `textContent`) so we
+  // don't keep landing on the same container we're trying to refine away from.
+  private static hasOwnTextOrIsInteractive(node: Element): boolean {
+    try {
+      if ((node as HTMLElement).matches?.(Recorder.INTERACTIVE_SELECTOR)) return true;
+    } catch {}
+    const children = node.childNodes;
+    for (let i = 0; i < children.length; i++) {
+      const c = children[i]!;
+      if (c.nodeType === 3 && (c.textContent || '').trim().length > 0) return true;
+    }
+    return false;
+  }
+
+  // When the click landed in the padding/gap of a container (no interactive
+  // ancestor matched, and the deepest target IS the container), find a more
+  // specific descendant near the click point so the label identifies the
+  // element the user was aiming at instead of concatenating every child's
+  // textContent. Returns the smallest descendant whose rect contains the
+  // click; failing that, the descendant whose rect edge is within
+  // NEAREST_LEAF_MAX_DIST of the click; otherwise null (keep the container).
+  private static findNearestClickedLeaf(root: Element, cx: number, cy: number): HTMLElement | null {
+    const all = root.getElementsByTagName('*');
+    const count = all.length;
+    if (count === 0 || count > Recorder.NEAREST_LEAF_MAX_NODES) return null;
+
+    let bestContains: HTMLElement | null = null;
+    let bestContainsArea = Infinity;
+    let bestNear: HTMLElement | null = null;
+    let bestNearDist = Infinity;
+
+    for (let i = 0; i < count; i++) {
+      const node = all[i] as HTMLElement;
+      if (!Recorder.hasOwnTextOrIsInteractive(node)) continue;
+      const rect = node.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      const insideX = cx >= rect.left && cx <= rect.right;
+      const insideY = cy >= rect.top && cy <= rect.bottom;
+      if (insideX && insideY) {
+        const area = rect.width * rect.height;
+        if (area < bestContainsArea) {
+          bestContainsArea = area;
+          bestContains = node;
+        }
+      } else {
+        const dx = cx < rect.left ? rect.left - cx : cx > rect.right ? cx - rect.right : 0;
+        const dy = cy < rect.top ? rect.top - cy : cy > rect.bottom ? cy - rect.bottom : 0;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < bestNearDist) {
+          bestNearDist = dist;
+          bestNear = node;
+        }
+      }
+    }
+
+    if (bestContains) return bestContains;
+    if (bestNear && bestNearDist <= Recorder.NEAREST_LEAF_MAX_DIST) return bestNear;
+    return null;
+  }
+
   /**
    * Check whether `el` is a scrollable container (overflow auto/scroll +
    * actual scrollable content). Cached per-Element via WeakMap so repeated
@@ -2547,7 +2616,18 @@ export class Recorder {
       if (!isInteractive && cursor && Recorder.INTERACTIVE_CURSORS.has(cursor)) {
         isInteractive = true;
       }
-      const el = interactive || target;
+      let el: HTMLElement | null = (interactive || target) as HTMLElement | null;
+      // Container miss: when no interactive ancestor matched, the click likely
+      // landed in padding/gap inside a container element. The DOM hands us the
+      // container as `target`, whose `textContent` recursively concatenates every
+      // descendant's text and produces unreadable labels like
+      // "Report this job Open Research Tailor resume". Refine to the nearest
+      // text-bearing or interactive descendant within 32px so the label and
+      // descriptor identify the element the user was aiming at.
+      if (!interactive && el && el !== document.body && el !== document.documentElement) {
+        const refined = Recorder.findNearestClickedLeaf(el, e.clientX, e.clientY);
+        if (refined) el = refined;
+      }
       const tagName = el?.tagName?.toLowerCase() || '';
       // Form controls (input, textarea, select): NEVER read .value, .textContent,
       // or rendered option text. .value is the user's typed input. <textarea>'s
